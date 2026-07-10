@@ -97,6 +97,7 @@ class FastWAM(torch.nn.Module):
             "inference_cooldown_steps": 0,
             "debug_log_samples": False,
             "debug_log_max_samples": 1,
+            "debug_log_rank": 0,
         }
         if kem_config:
             self.kem_config.update(dict(kem_config))
@@ -108,6 +109,7 @@ class FastWAM(torch.nn.Module):
         self.event_commit_threshold = float(self.kem_config.get("event_commit_threshold", 0.55))
         self.kem_debug_log_samples = bool(self.kem_config.get("debug_log_samples", False))
         self.kem_debug_log_max_samples = max(int(self.kem_config.get("debug_log_max_samples", 1)), 1)
+        self.kem_debug_log_rank = int(self.kem_config.get("debug_log_rank", 0))
         self.kem_head = None
         if self.kem_enabled:
             action_hidden_dim = int(self.action_expert.hidden_dim)
@@ -736,6 +738,12 @@ class FastWAM(torch.nn.Module):
     ) -> None:
         if not self.kem_debug_log_samples:
             return
+        if self.kem_debug_log_rank >= 0:
+            current_rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                current_rank = int(torch.distributed.get_rank())
+            if current_rank != self.kem_debug_log_rank:
+                return
 
         pred_offset = event_pred["pred_event_offset"].detach()
         pred_should = event_pred["should_trigger_event"].detach().to(dtype=torch.bool)

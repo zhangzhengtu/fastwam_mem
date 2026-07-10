@@ -69,6 +69,7 @@ kem:
   inference_cooldown_steps: 20
   debug_log_samples: false
   debug_log_max_samples: 1
+  debug_log_rank: 0
 
 keyframe_memory:
   enabled: true
