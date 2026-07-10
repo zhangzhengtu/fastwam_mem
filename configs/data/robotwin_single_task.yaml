@@ -1,0 +1,34 @@
+defaults:
+  - robotwin
+  - _self_
+
+# Single-task RoboTwin LeRobot v3.0 data config.
+# Override `task_name` to train another task with the same directory layout.
+task_name: adjust_bottle
+robotwin_v3_root: /mnt/inspurfs/efm_t/yangganlin/data/RoboTwin-LeRobot-v3.0
+embodiment: aloha-agilex
+clean_dir_name: ${data.embodiment}_clean_50
+randomized_dir_name: ${data.embodiment}_randomized_500
+
+train:
+  dataset_dirs:
+    - ${data.robotwin_v3_root}/${data.task_name}/${data.randomized_dir_name}
+    - ${data.robotwin_v3_root}/${data.task_name}/${data.clean_dir_name}
+  # Train and val both see clean + randomized, split by episode inside each
+  # LeRobot dataset. This keeps the same behavior as the default RoboTwin cfg.
+  val_set_proportion: 0.01
+  is_training_set: true
+  # Null means the training dataset computes task-specific action/state stats
+  # and writes them to `${output_dir}/dataset_stats.json`.
+  pretrained_norm_stats: null
+  text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_single/${data.task_name}
+
+val:
+  dataset_dirs:
+    - ${data.robotwin_v3_root}/${data.task_name}/${data.randomized_dir_name}
+    - ${data.robotwin_v3_root}/${data.task_name}/${data.clean_dir_name}
+  val_set_proportion: 0.01
+  is_training_set: false
+  # Runtime will pass the training-run stats path to val when this is null.
+  pretrained_norm_stats: null
+  text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_single/${data.task_name}
