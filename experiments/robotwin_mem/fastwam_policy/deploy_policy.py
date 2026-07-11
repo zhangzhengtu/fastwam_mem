@@ -36,6 +36,7 @@ ROBOTWIN_HEAD_SIZE_WH = (320, 256)
 ROBOTWIN_WRIST_SIZE_WH = (160, 128)
 VIS_CELL_SIZE_WH = (160, 128)
 DEFAULT_EVAL_VIDEO_FPS = 10
+MIN_PRED_KEYFRAME_COMMIT_GAP_STEPS = 200
 
 
 def _is_none_like(value: Any) -> bool:
@@ -248,6 +249,10 @@ class WorldActionRobotWinMemPolicy:
         self._pending_memory_confidence: float = 0.0
         self._last_committed_memory_step: int = -10**9
         self._memory_cooldown_steps = int(kem_cfg.get("inference_cooldown_steps", 0) or 0)
+        self._memory_cooldown_steps = max(
+            self._memory_cooldown_steps,
+            MIN_PRED_KEYFRAME_COMMIT_GAP_STEPS,
+        )
         self._memory_nms_window = int(kem_cfg.get("inference_nms_window", 0) or 0)
 
         self.pending_actions: deque[np.ndarray] = deque()
@@ -255,6 +260,7 @@ class WorldActionRobotWinMemPolicy:
         self.step_count = 0
         self._eval_video_frames: list[Image.Image] = []
         self._active_plan_pred_frames: list[np.ndarray] = []
+        self._pred_keyframe_snapshots: list[dict[str, Any]] = []
         self._plan_actions_executed = 0
         self._plan_saved_pred_indices: set[int] = set()
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -284,13 +290,26 @@ class WorldActionRobotWinMemPolicy:
             memory_steps[slot] = int(step)
         return memory_video, memory_mask, memory_steps
 
-    def _commit_memory_observation(self, observation: Dict[str, Any], step: int) -> None:
+    def _commit_memory_observation(
+        self,
+        observation: Dict[str, Any],
+        step: int,
+        confidence: Optional[float] = None,
+    ) -> None:
         if not self.memory_enabled:
             return
         if step - self._last_committed_memory_step < self._memory_cooldown_steps:
             return
         image_tensor = self._build_robotwin_image_tensor(observation)[0].detach().to(device="cpu", dtype=torch.float32)
         self.memory_bank.append((int(step), image_tensor))
+        head_image = _to_uint8_rgb(self._require_camera_rgb(observation["observation"], "head_camera")).copy()
+        self._pred_keyframe_snapshots.append(
+            {
+                "step": int(step),
+                "confidence": float(confidence or 0.0),
+                "image": head_image,
+            }
+        )
         self._last_committed_memory_step = int(step)
         logger.debug("Committed FastWAM keyframe memory at step=%d count=%d", step, len(self.memory_bank))
 
@@ -299,7 +318,11 @@ class WorldActionRobotWinMemPolicy:
             return
         if self.step_count < self._pending_memory_commit_step:
             return
-        self._commit_memory_observation(observation, self.step_count)
+        self._commit_memory_observation(
+            observation,
+            self.step_count,
+            confidence=self._pending_memory_confidence,
+        )
         self._pending_memory_commit_step = None
         self._pending_memory_confidence = 0.0
 
@@ -434,12 +457,14 @@ class WorldActionRobotWinMemPolicy:
         del episode_idx
         self._eval_video_frames.clear()
         self._active_plan_pred_frames.clear()
+        self._pred_keyframe_snapshots.clear()
         self._plan_actions_executed = 0
         self._plan_saved_pred_indices.clear()
 
     def save_eval_video(self, path: str, fps: Optional[int] = None) -> Optional[str]:
         if not self.eval_video_enabled:
             return None
+        self._save_pred_keyframe_snapshots(path)
         if not self._eval_video_frames:
             logger.warning("No eval comparison frames were collected; skip saving %s", path)
             return None
@@ -452,6 +477,21 @@ class WorldActionRobotWinMemPolicy:
         shutil.copyfile(tmp_path, final_path)
         tmp_path.unlink(missing_ok=True)
         return str(final_path)
+
+    def _save_pred_keyframe_snapshots(self, video_path: str) -> Optional[str]:
+        if not self._pred_keyframe_snapshots:
+            return None
+
+        final_path = Path(video_path)
+        keyframe_dir = final_path.with_name(f"{final_path.stem}_pred_keyframes")
+        keyframe_dir.mkdir(parents=True, exist_ok=True)
+        for index, snapshot in enumerate(self._pred_keyframe_snapshots):
+            step = int(snapshot["step"])
+            confidence = float(snapshot["confidence"])
+            image = Image.fromarray(_to_uint8_rgb(snapshot["image"]), mode="RGB")
+            image.save(keyframe_dir / f"{index:03d}_step_{step:06d}_conf_{confidence:.4f}.png")
+        logger.info("Saved %d predicted keyframe images to %s", len(self._pred_keyframe_snapshots), keyframe_dir)
+        return str(keyframe_dir)
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
@@ -548,6 +588,7 @@ class WorldActionRobotWinMemPolicy:
     def reset(self) -> None:
         self.pending_actions.clear()
         self.memory_bank.clear()
+        self._pred_keyframe_snapshots.clear()
         self._pending_memory_commit_step = None
         self._pending_memory_confidence = 0.0
         self._last_committed_memory_step = -10**9

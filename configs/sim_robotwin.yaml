@@ -33,6 +33,8 @@ EVALUATION:
   tiled: false
   timing_enabled: false
   skip_get_obs_within_replan: false
+  eval_video_log: false
+  eval_video_fps: 10
 
   # Runtime inputs
   dataset_stats_path: null

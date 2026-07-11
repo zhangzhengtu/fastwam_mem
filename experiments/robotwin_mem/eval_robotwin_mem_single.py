@@ -251,6 +251,8 @@ def main(cfg: DictConfig):
         "skip_get_obs_within_replan",
         cfg.EVALUATION.skip_get_obs_within_replan,
     )
+    _append_override(overrides, "eval_video_log", cfg.EVALUATION.eval_video_log)
+    _append_override(overrides, "eval_video_fps", cfg.EVALUATION.eval_video_fps)
 
     cmd = [
         sys.executable,

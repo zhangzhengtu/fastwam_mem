@@ -24,4 +24,5 @@ rand_device: cpu
 tiled: false
 timing_enabled: false
 skip_get_obs_within_replan: false
+eval_video_log: false
 eval_video_fps: 10
