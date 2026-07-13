@@ -21,6 +21,10 @@ logger = get_logger(__name__)
 
 
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+MEMORY_SOURCE_PAD = 0
+MEMORY_SOURCE_HISTORY = 1
+MEMORY_SOURCE_KEYFRAME_TEACHER = 2
+MEMORY_SOURCE_KEYFRAME_PREDICTED = 3
 
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
@@ -90,10 +94,28 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.teacher_event_min_offset = int(self.keyframe_supervision_cfg.get("event_future_min_offset", 1))
         self.teacher_event_threshold = float(self.keyframe_supervision_cfg.get("teacher_event_threshold", 0.55))
         self.max_memory_keyframes = int(self.keyframe_memory_cfg.get("max_keyframes", 0))
+        self.max_keyframe_slots = int(
+            self.keyframe_memory_cfg.get("max_keyframe_slots", self.max_memory_keyframes)
+        )
+        self.max_recent_slots = int(
+            self.keyframe_memory_cfg.get("max_recent_slots", 0)
+        )
         self.include_current_keyframe = bool(self.keyframe_memory_cfg.get("include_current_keyframe", False))
         self.memory_selection = str(self.keyframe_memory_cfg.get("selection", "latest"))
         self.memory_order = str(self.keyframe_memory_cfg.get("order", "chronological"))
         self.keyframe_input_memory_source = str(self.keyframe_memory_cfg.get("source", "teacher"))
+        self.history_step_offsets = [
+            offset
+            for offset in self._parse_history_step_offsets(
+                self.keyframe_memory_cfg.get("history_step_offsets", [])
+            )
+            if offset <= 0
+        ]
+        if self.max_recent_slots <= 0:
+            self.max_recent_slots = len(self.history_step_offsets)
+        self.max_keyframe_slots = max(self.max_keyframe_slots, 0)
+        self.max_recent_slots = max(self.max_recent_slots, 0)
+        self.max_memory_blocks = self.max_keyframe_slots + self.max_recent_slots
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -287,6 +309,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             out[: values.numel()] = values
         return out
 
+    @staticmethod
+    def _parse_history_step_offsets(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            if text == "" or text.lower() in {"none", "null", "[]"}:
+                return []
+            parts = [part.strip() for part in text.strip("[]").split(",")]
+            return [int(part) for part in parts if part]
+        try:
+            return [int(item) for item in value]
+        except TypeError:
+            return [int(value)]
+
     def _build_chunk_keyframe_supervision(
         self,
         trajectory_id: int,
@@ -357,15 +394,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "teacher_commit_timestep": torch.tensor(teacher_commit_timestep, dtype=torch.long),
         }
 
-    def _build_memory_keyframes(self, trajectory_id: int, step_index: int) -> dict[str, Any]:
-        max_keyframes = max(int(self.max_memory_keyframes), 0)
+    def _build_memory_block(self, trajectory_id: int, step_index: int) -> dict[str, Any]:
+        max_keyframes = max(int(self.max_keyframe_slots), 0)
+        max_recent = max(int(self.max_recent_slots), 0)
+        max_blocks = max_keyframes + max_recent
         height, width = int(self.video_size[0]), int(self.video_size[1])
-        if not self.keyframe_memory_enabled or max_keyframes == 0:
+        if not self.keyframe_memory_enabled or max_blocks == 0:
             return {}
 
-        memory_video = torch.zeros((max_keyframes, 3, height, width), dtype=torch.float32)
-        memory_mask = torch.zeros((max_keyframes,), dtype=torch.bool)
-        memory_steps = torch.full((max_keyframes,), -1, dtype=torch.long)
+        memory_video = torch.zeros((max_blocks, 3, height, width), dtype=torch.float32)
+        memory_mask = torch.zeros((max_blocks,), dtype=torch.bool)
+        memory_steps = torch.full((max_blocks,), -1, dtype=torch.long)
+        memory_source = torch.full((max_blocks,), MEMORY_SOURCE_PAD, dtype=torch.long)
+        memory_offsets = torch.zeros((max_blocks,), dtype=torch.long)
+
+        selected_keyframes: list[int] = []
+        seen_steps: set[int] = set()
 
         keyframe_steps = self.get_keyframe_steps(trajectory_id)
         if self.include_current_keyframe:
@@ -375,29 +419,64 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         candidates = sorted(set(candidates))
         if self.memory_selection != "latest":
             logger.warning("Unsupported keyframe memory selection `%s`; falling back to latest.", self.memory_selection)
-        candidates = candidates[-max_keyframes:]
+        selected_keyframes = candidates[-max_keyframes:] if max_keyframes > 0 else []
         if self.memory_order == "reverse_chronological":
-            candidates = list(reversed(candidates))
+            selected_keyframes = sorted(selected_keyframes, reverse=True)
+        else:
+            selected_keyframes = sorted(selected_keyframes)
 
-        for slot, keyframe_step in enumerate(candidates):
-            global_index = self.episode_step_to_global_index(trajectory_id, keyframe_step)
-            keyframe_sample = self.lerobot_dataset[global_index]
-            keyframe_video, _ = self._format_video(
-                keyframe_sample["pixel_values"],
-                keyframe_sample.get("image_is_pad"),
+        def fill_slot(slot: int, memory_step: int, source: int) -> None:
+            global_index = self.episode_step_to_global_index(trajectory_id, memory_step)
+            memory_sample = self.lerobot_dataset[global_index]
+            formatted_video, _ = self._format_video(
+                memory_sample["pixel_values"],
+                memory_sample.get("image_is_pad"),
                 [0],
             )
-            memory_video[slot] = keyframe_video[:, 0]
+            memory_video[slot] = formatted_video[:, 0]
             memory_mask[slot] = True
-            memory_steps[slot] = int(keyframe_step)
+            memory_steps[slot] = int(memory_step)
+            memory_source[slot] = int(source)
+            memory_offsets[slot] = int(memory_step) - int(step_index)
+
+        for slot, keyframe_step in enumerate(selected_keyframes[:max_keyframes]):
+            fill_slot(slot, keyframe_step, MEMORY_SOURCE_KEYFRAME_TEACHER)
+            seen_steps.add(int(keyframe_step))
+
+        selected_recent: list[int] = []
+        for offset in self.history_step_offsets[:max_recent]:
+            history_step = int(step_index) + int(offset)
+            if history_step < 0 or history_step in seen_steps:
+                continue
+            selected_recent.append(history_step)
+            seen_steps.add(history_step)
+
+        recent_start = max_keyframes
+        for idx, history_step in enumerate(selected_recent[:max_recent]):
+            fill_slot(recent_start + idx, history_step, MEMORY_SOURCE_HISTORY)
+
+        memory_count = int(memory_mask.sum().item())
 
         return {
+            "memory_block_video": memory_video,
+            "memory_block_mask": memory_mask,
+            "memory_block_steps": memory_steps,
+            "memory_block_source": memory_source,
+            "memory_block_offsets": memory_offsets,
+            "memory_block_count": torch.tensor(memory_count, dtype=torch.long),
             "memory_keyframe_video": memory_video,
             "memory_keyframe_mask": memory_mask,
             "memory_keyframe_steps": memory_steps,
-            "memory_keyframe_count": torch.tensor(len(candidates), dtype=torch.long),
-            "keyframe_input_memory_source": self.keyframe_input_memory_source,
+            "memory_keyframe_count": torch.tensor(memory_count, dtype=torch.long),
+            "keyframe_input_memory_source": (
+                "history_steps+" + self.keyframe_input_memory_source
+                if self.history_step_offsets
+                else self.keyframe_input_memory_source
+            ),
         }
+
+    def _build_memory_keyframes(self, trajectory_id: int, step_index: int) -> dict[str, Any]:
+        return self._build_memory_block(trajectory_id=trajectory_id, step_index=step_index)
 
     def _get(self, idx):
         sequence_meta = self._parse_sequence_index(idx)

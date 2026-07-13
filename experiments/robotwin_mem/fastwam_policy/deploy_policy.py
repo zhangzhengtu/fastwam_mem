@@ -26,7 +26,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.datasets.lerobot.robot_video_dataset import (
+    DEFAULT_PROMPT,
+    MEMORY_SOURCE_HISTORY,
+    MEMORY_SOURCE_KEYFRAME_PREDICTED,
+    MEMORY_SOURCE_PAD,
+)
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.video_io import save_mp4
 
@@ -37,6 +42,7 @@ ROBOTWIN_WRIST_SIZE_WH = (160, 128)
 VIS_CELL_SIZE_WH = (160, 128)
 DEFAULT_EVAL_VIDEO_FPS = 10
 MIN_PRED_KEYFRAME_COMMIT_GAP_STEPS = 200
+PRED_KEYFRAME_COMMIT_THRESHOLD = 0.95
 
 
 def _is_none_like(value: Any) -> bool:
@@ -69,6 +75,20 @@ def _parse_optional_float(value: Any) -> Optional[float]:
     if _is_none_like(value):
         return None
     return float(value)
+
+
+def _parse_int_list(value: Any) -> list[int]:
+    if _is_none_like(value):
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "" or text.lower() in {"[]", "none", "null"}:
+            return []
+        return [int(part.strip()) for part in text.strip("[]").split(",") if part.strip()]
+    try:
+        return [int(item) for item in value]
+    except TypeError:
+        return [int(value)]
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -221,6 +241,11 @@ class WorldActionRobotWinMemPolicy:
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
+        self.event_commit_threshold = PRED_KEYFRAME_COMMIT_THRESHOLD
+        if hasattr(self.model, "event_commit_threshold"):
+            self.model.event_commit_threshold = self.event_commit_threshold
+        if isinstance(getattr(self.model, "kem_config", None), dict):
+            self.model.kem_config["event_commit_threshold"] = self.event_commit_threshold
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -242,9 +267,19 @@ class WorldActionRobotWinMemPolicy:
         self.eval_video_fps = int(max(1, eval_video_fps))
         keyframe_memory_cfg = getattr(self.model, "keyframe_memory_config", {}) or {}
         kem_cfg = getattr(self.model, "kem_config", {}) or {}
-        self.memory_max_keyframes = int(keyframe_memory_cfg.get("max_keyframes", 0))
-        self.memory_enabled = bool(keyframe_memory_cfg.get("enabled", False)) and self.memory_max_keyframes > 0
+        self.history_step_offsets = _parse_int_list(keyframe_memory_cfg.get("history_step_offsets", []))
+        self.history_step_offsets = [offset for offset in self.history_step_offsets if offset <= 0]
+        self.memory_max_keyframes = max(int(keyframe_memory_cfg.get("max_keyframes", 0)), 0)
+        self.memory_max_recent = max(
+            int(keyframe_memory_cfg.get("max_recent_slots", len(self.history_step_offsets))),
+            0,
+        )
+        self.memory_max_blocks = self.memory_max_keyframes + self.memory_max_recent
+        self.memory_enabled = bool(keyframe_memory_cfg.get("enabled", False)) and self.memory_max_blocks > 0
+        self.history_memory_enabled = self.memory_enabled and bool(self.history_step_offsets)
         self.memory_bank: deque[tuple[int, torch.Tensor]] = deque(maxlen=max(self.memory_max_keyframes, 1))
+        history_maxlen = max([abs(offset) for offset in self.history_step_offsets] + [0]) + 1
+        self.history_observation_bank: deque[tuple[int, torch.Tensor]] = deque(maxlen=max(history_maxlen, 1))
         self._pending_memory_commit_step: Optional[int] = None
         self._pending_memory_confidence: float = 0.0
         self._last_committed_memory_step: int = -10**9
@@ -266,29 +301,91 @@ class WorldActionRobotWinMemPolicy:
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized WorldActionRobotWinMemPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinMemPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d | history_offsets=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self.history_step_offsets,
         )
 
-    def _memory_tensors(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if not self.memory_enabled or not self.memory_bank:
-            return None, None, None
-        bank = list(self.memory_bank)[-self.memory_max_keyframes:]
-        _, first_image = bank[0]
+    def _memory_block_tensors(
+        self,
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        if not self.memory_enabled:
+            return None, None, None, None, None
+
+        keyframe_entries: list[tuple[int, torch.Tensor]] = []
+        recent_entries: list[tuple[int, torch.Tensor]] = []
+        seen_steps: set[int] = set()
+        if self.memory_max_keyframes > 0:
+            for step, image in list(self.memory_bank)[-self.memory_max_keyframes:]:
+                keyframe_entries.append((int(step), image))
+                seen_steps.add(int(step))
+
+        if self.memory_max_recent > 0 and self.history_step_offsets:
+            history_by_step = {int(step): image for step, image in self.history_observation_bank}
+            for offset in self.history_step_offsets[: self.memory_max_recent]:
+                target_step = int(self.step_count + offset)
+                image = history_by_step.get(target_step)
+                if image is None or target_step in seen_steps:
+                    continue
+                recent_entries.append((target_step, image))
+                seen_steps.add(target_step)
+
+        keyframe_entries = sorted(keyframe_entries, key=lambda item: item[0])
+
+        entries = keyframe_entries + recent_entries
+        if not entries:
+            return None, None, None, None, None
+
+        _, first_image = entries[0]
         memory_video = torch.zeros(
-            (self.memory_max_keyframes,) + tuple(first_image.shape),
+            (self.memory_max_blocks,) + tuple(first_image.shape),
             dtype=first_image.dtype,
         )
-        memory_mask = torch.zeros((self.memory_max_keyframes,), dtype=torch.bool)
-        memory_steps = torch.full((self.memory_max_keyframes,), -1, dtype=torch.long)
-        for slot, (step, image_tensor) in enumerate(bank):
+        memory_mask = torch.zeros((self.memory_max_blocks,), dtype=torch.bool)
+        memory_steps = torch.full((self.memory_max_blocks,), -1, dtype=torch.long)
+        memory_source = torch.full((self.memory_max_blocks,), MEMORY_SOURCE_PAD, dtype=torch.long)
+        memory_offsets = torch.zeros((self.memory_max_blocks,), dtype=torch.long)
+
+        for slot, (step, image_tensor) in enumerate(keyframe_entries[: self.memory_max_keyframes]):
             memory_video[slot] = image_tensor
             memory_mask[slot] = True
             memory_steps[slot] = int(step)
+            memory_source[slot] = MEMORY_SOURCE_KEYFRAME_PREDICTED
+            memory_offsets[slot] = int(step) - int(self.step_count)
+
+        recent_start = self.memory_max_keyframes
+        for idx, (step, image_tensor) in enumerate(recent_entries[: self.memory_max_recent]):
+            slot = recent_start + idx
+            memory_video[slot] = image_tensor
+            memory_mask[slot] = True
+            memory_steps[slot] = int(step)
+            memory_source[slot] = MEMORY_SOURCE_HISTORY
+            memory_offsets[slot] = int(step) - int(self.step_count)
+
+        return memory_video, memory_mask, memory_steps, memory_source, memory_offsets
+
+    def _memory_tensors(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        memory_video, memory_mask, memory_steps, _, _ = self._memory_block_tensors()
         return memory_video, memory_mask, memory_steps
+
+    def _record_history_observation(self, observation: Optional[Dict[str, Any]]) -> None:
+        if observation is None or not self.history_memory_enabled:
+            return
+        image_tensor = self._build_robotwin_image_tensor(observation)[0].detach().to(device="cpu", dtype=torch.float32)
+        step = int(self.step_count)
+        if self.history_observation_bank and int(self.history_observation_bank[-1][0]) == step:
+            self.history_observation_bank[-1] = (step, image_tensor)
+        else:
+            self.history_observation_bank.append((step, image_tensor))
 
     def _commit_memory_observation(
         self,
@@ -334,6 +431,8 @@ class WorldActionRobotWinMemPolicy:
             return
         commit_step = int(self.step_count + pred_offset)
         confidence = float(pred.get("pred_event_confidence", 0.0))
+        if confidence < self.event_commit_threshold:
+            return
         if commit_step - self._last_committed_memory_step < self._memory_cooldown_steps:
             return
         if self._pending_memory_commit_step is not None and self._memory_nms_window > 0:
@@ -521,7 +620,15 @@ class WorldActionRobotWinMemPolicy:
         infer_params = inspect.signature(infer_method).parameters
         if "num_video_frames" in infer_params:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
-        if "memory_keyframe_video" in infer_params:
+        if "memory_block_video" in infer_params:
+            memory_video, memory_mask, memory_steps, memory_source, memory_offsets = self._memory_block_tensors()
+            if memory_video is not None:
+                infer_kwargs["memory_block_video"] = memory_video
+                infer_kwargs["memory_block_mask"] = memory_mask
+                infer_kwargs["memory_block_steps"] = memory_steps
+                infer_kwargs["memory_block_source"] = memory_source
+                infer_kwargs["memory_block_offsets"] = memory_offsets
+        elif "memory_keyframe_video" in infer_params:
             memory_video, memory_mask, memory_steps = self._memory_tensors()
             if memory_video is not None:
                 infer_kwargs["memory_keyframe_video"] = memory_video
@@ -548,10 +655,15 @@ class WorldActionRobotWinMemPolicy:
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     def should_request_observation(self) -> bool:
-        return (not self.pending_actions) or self._pending_memory_commit_step is not None
+        return (
+            self.history_memory_enabled
+            or (not self.pending_actions)
+            or self._pending_memory_commit_step is not None
+        )
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
         self._maybe_commit_pending_memory(observation)
+        self._record_history_observation(observation)
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -588,6 +700,7 @@ class WorldActionRobotWinMemPolicy:
     def reset(self) -> None:
         self.pending_actions.clear()
         self.memory_bank.clear()
+        self.history_observation_bank.clear()
         self._pred_keyframe_snapshots.clear()
         self._pending_memory_commit_step = None
         self._pending_memory_confidence = 0.0

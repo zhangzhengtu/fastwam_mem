@@ -74,6 +74,11 @@ class FastWAMJoint(FastWAM):
         memory_keyframe_video: Optional[torch.Tensor] = None,
         memory_keyframe_mask: Optional[torch.Tensor] = None,
         memory_keyframe_steps: Optional[torch.Tensor] = None,
+        memory_block_video: Optional[torch.Tensor] = None,
+        memory_block_mask: Optional[torch.Tensor] = None,
+        memory_block_steps: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         if test_action_with_infer_action:
             logger.warning(
@@ -100,6 +105,11 @@ class FastWAMJoint(FastWAM):
             memory_keyframe_video=memory_keyframe_video,
             memory_keyframe_mask=memory_keyframe_mask,
             memory_keyframe_steps=memory_keyframe_steps,
+            memory_block_video=memory_block_video,
+            memory_block_mask=memory_block_mask,
+            memory_block_steps=memory_block_steps,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
         )
 
     @torch.no_grad()
@@ -122,11 +132,20 @@ class FastWAMJoint(FastWAM):
         memory_keyframe_video: Optional[torch.Tensor] = None,
         memory_keyframe_mask: Optional[torch.Tensor] = None,
         memory_keyframe_steps: Optional[torch.Tensor] = None,
+        memory_block_video: Optional[torch.Tensor] = None,
+        memory_block_mask: Optional[torch.Tensor] = None,
+        memory_block_steps: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
-        memory_keyframe_video, memory_keyframe_mask = self._prepare_inference_memory_keyframes(
-            memory_keyframe_video,
-            memory_keyframe_mask,
+        memory_keyframe_video, memory_keyframe_mask, memory_block_source, memory_block_offsets = self._prepare_inference_memory_block(
+            memory_block_video=memory_block_video,
+            memory_block_mask=memory_block_mask,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
+            memory_keyframe_video=memory_keyframe_video,
+            memory_keyframe_mask=memory_keyframe_mask,
         )
 
         if input_image.ndim == 3:
@@ -244,6 +263,8 @@ class FastWAMJoint(FastWAM):
                 gt_action=None,
                 memory_keyframe_video=memory_keyframe_video,
                 memory_keyframe_mask=memory_keyframe_mask,
+                memory_block_source=memory_block_source,
+                memory_block_offsets=memory_block_offsets,
                 tiled=tiled,
             )
 

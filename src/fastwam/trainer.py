@@ -90,6 +90,10 @@ class Wan22Trainer:
         kem_head = getattr(self.model, "kem_head", None)
         if kem_head is not None:
             trainable_params.extend(list(kem_head.parameters()))
+        for param_name in ("memory_bos_token", "recent_bos_token"):
+            param = getattr(self.model, param_name, None)
+            if isinstance(param, torch.nn.Parameter):
+                trainable_params.append(param)
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -323,6 +327,10 @@ class Wan22Trainer:
         if kem_head is not None:
             kem_head.train()
             kem_head.requires_grad_(True)
+        for param_name in ("memory_bos_token", "recent_bos_token"):
+            param = getattr(model, param_name, None)
+            if isinstance(param, torch.nn.Parameter):
+                param.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -332,6 +340,7 @@ class Wan22Trainer:
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        memory_payload = {}
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -393,6 +402,35 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
+        for key in (
+            "memory_block_video",
+            "memory_block_mask",
+            "memory_block_steps",
+            "memory_block_source",
+            "memory_block_offsets",
+            "memory_keyframe_video",
+            "memory_keyframe_mask",
+            "memory_keyframe_steps",
+        ):
+            value = sample.get(key, None)
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"`sample['{key}']` must be a torch.Tensor, got {type(value)}")
+            if key.endswith("_video"):
+                if value.ndim == 4:
+                    value = value.unsqueeze(0)
+                if value.ndim != 5:
+                    raise ValueError(f"`sample['{key}']` must be [K,3,H,W] or [B,K,3,H,W], got {tuple(value.shape)}")
+            else:
+                if value.ndim == 1:
+                    value = value.unsqueeze(0)
+                if value.ndim != 2:
+                    raise ValueError(f"`sample['{key}']` must be [K] or [B,K], got {tuple(value.shape)}")
+            if value.shape[0] != video.shape[0]:
+                raise ValueError(f"`sample['{key}']` batch mismatch: {value.shape[0]} vs video batch {video.shape[0]}")
+            memory_payload[key] = value
+
         return {
             "video": video,
             "prompt": prompt,
@@ -401,6 +439,7 @@ class Wan22Trainer:
             "context": context,
             "context_mask": context_mask,
             "action_horizon": action_horizon,
+            **memory_payload,
         }
 
     @torch.no_grad()
@@ -448,6 +487,26 @@ class Wan22Trainer:
             infer_kwargs["context_mask"] = sample["context_mask"][0]
         else:
             infer_kwargs["prompt"] = prompt
+
+        infer_params = inspect.signature(model.infer).parameters
+        if "memory_block_video" in infer_params and "memory_block_video" in sample:
+            infer_kwargs["memory_block_video"] = sample["memory_block_video"][0]
+            memory_block_mask = sample.get("memory_block_mask", sample.get("memory_keyframe_mask"))
+            if memory_block_mask is not None:
+                infer_kwargs["memory_block_mask"] = memory_block_mask[0]
+            if sample.get("memory_block_steps") is not None:
+                infer_kwargs["memory_block_steps"] = sample["memory_block_steps"][0]
+            if sample.get("memory_block_source") is not None:
+                infer_kwargs["memory_block_source"] = sample["memory_block_source"][0]
+            if sample.get("memory_block_offsets") is not None:
+                infer_kwargs["memory_block_offsets"] = sample["memory_block_offsets"][0]
+        elif "memory_keyframe_video" in infer_params and "memory_keyframe_video" in sample:
+            infer_kwargs["memory_keyframe_video"] = sample["memory_keyframe_video"][0]
+            memory_keyframe_mask = sample.get("memory_keyframe_mask")
+            if memory_keyframe_mask is not None:
+                infer_kwargs["memory_keyframe_mask"] = memory_keyframe_mask[0]
+            if sample.get("memory_keyframe_steps") is not None:
+                infer_kwargs["memory_keyframe_steps"] = sample["memory_keyframe_steps"][0]
 
         pred = model.infer(
             **infer_kwargs,

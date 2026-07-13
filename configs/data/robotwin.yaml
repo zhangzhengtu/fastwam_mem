@@ -40,6 +40,7 @@ train:
   keyframe_memory:
     enabled: true
     max_keyframes: 5
+    history_step_offsets: [-10, -5]
     include_current_keyframe: false
     selection: latest
     order: chronological
@@ -116,6 +117,7 @@ val:
   keyframe_memory:
     enabled: true
     max_keyframes: 5
+    history_step_offsets: [-10, -5]
     include_current_keyframe: false
     selection: latest
     order: chronological

@@ -74,6 +74,7 @@ kem:
 keyframe_memory:
   enabled: true
   max_keyframes: 5
+  history_step_offsets: [-10, -5]
   include_current_keyframe: false
   selection: latest
   order: chronological
@@ -88,3 +89,10 @@ keyframe_memory:
   rope_temporal_index: 0
   t_mod_source: current_first_frame
   compress_tokens: false
+  structured_block: true
+  use_memory_bos: true
+  use_recent_bos: true
+  memory_bos_insert_when_empty: false
+  recent_bos_insert_when_empty: false
+  use_relative_memory_rope: true
+  relative_memory_rope_max_offset: 128

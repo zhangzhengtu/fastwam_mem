@@ -14,6 +14,11 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
 
+MEMORY_SOURCE_PAD = 0
+MEMORY_SOURCE_HISTORY = 1
+MEMORY_SOURCE_KEYFRAME_TEACHER = 2
+MEMORY_SOURCE_KEYFRAME_PREDICTED = 3
+
 
 class FastWAM(torch.nn.Module):
     """MoT world model with video/action experts."""
@@ -123,6 +128,7 @@ class FastWAM(torch.nn.Module):
         self.keyframe_memory_config = {
             "enabled": False,
             "max_keyframes": 0,
+            "history_step_offsets": [],
             "include_current_keyframe": False,
             "selection": "latest",
             "order": "chronological",
@@ -132,11 +138,44 @@ class FastWAM(torch.nn.Module):
             "rope_temporal_index": 0,
             "t_mod_source": "current_first_frame",
             "compress_tokens": False,
+            "structured_block": False,
+            "use_memory_bos": True,
+            "use_recent_bos": True,
+            "memory_bos_insert_when_empty": False,
+            "recent_bos_insert_when_empty": False,
+            "use_relative_memory_rope": False,
+            "relative_memory_rope_max_offset": 128,
         }
         if keyframe_memory_config:
             self.keyframe_memory_config.update(dict(keyframe_memory_config))
         self.keyframe_memory_enabled = bool(self.keyframe_memory_config.get("enabled", False))
         self.keyframe_memory_max_keyframes = int(self.keyframe_memory_config.get("max_keyframes", 0))
+        self.keyframe_memory_structured_block = bool(
+            self.keyframe_memory_config.get("structured_block", False)
+        )
+        self.use_memory_bos = bool(self.keyframe_memory_config.get("use_memory_bos", True))
+        self.use_recent_bos = bool(self.keyframe_memory_config.get("use_recent_bos", True))
+        self.memory_bos_insert_when_empty = bool(
+            self.keyframe_memory_config.get("memory_bos_insert_when_empty", False)
+        )
+        self.recent_bos_insert_when_empty = bool(
+            self.keyframe_memory_config.get("recent_bos_insert_when_empty", False)
+        )
+        self.use_relative_memory_rope = bool(
+            self.keyframe_memory_config.get("use_relative_memory_rope", False)
+        )
+        self.relative_memory_rope_max_offset = max(
+            int(self.keyframe_memory_config.get("relative_memory_rope_max_offset", 128)),
+            0,
+        )
+        self.memory_bos_token = nn.Parameter(
+            torch.zeros(1, 1, int(self.video_expert.hidden_dim), dtype=torch_dtype)
+        )
+        self.recent_bos_token = nn.Parameter(
+            torch.zeros(1, 1, int(self.video_expert.hidden_dim), dtype=torch_dtype)
+        )
+        nn.init.normal_(self.memory_bos_token, std=0.02)
+        nn.init.normal_(self.recent_bos_token, std=0.02)
 
         self.to(self.device)
 
@@ -428,48 +467,72 @@ class FastWAM(torch.nn.Module):
         if image_is_pad is not None:
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
-        memory_keyframe_video = sample.get("memory_keyframe_video", None)
-        memory_keyframe_mask = sample.get("memory_keyframe_mask", None)
-        memory_keyframe_steps = sample.get("memory_keyframe_steps", None)
-        if memory_keyframe_video is not None:
-            if memory_keyframe_video.ndim != 5:
+        memory_block_video = sample.get("memory_block_video", sample.get("memory_keyframe_video", None))
+        memory_block_mask = sample.get("memory_block_mask", sample.get("memory_keyframe_mask", None))
+        memory_block_steps = sample.get("memory_block_steps", sample.get("memory_keyframe_steps", None))
+        memory_block_source = sample.get("memory_block_source", None)
+        memory_block_offsets = sample.get("memory_block_offsets", None)
+        if memory_block_video is not None:
+            if memory_block_video.ndim != 5:
                 raise ValueError(
-                    "`sample['memory_keyframe_video']` must be [B,K,3,H,W], "
-                    f"got shape {tuple(memory_keyframe_video.shape)}"
+                    "`sample['memory_block_video']` must be [B,K,3,H,W], "
+                    f"got shape {tuple(memory_block_video.shape)}"
                 )
-            if memory_keyframe_video.shape[0] != batch_size or memory_keyframe_video.shape[2] != 3:
+            if memory_block_video.shape[0] != batch_size or memory_block_video.shape[2] != 3:
                 raise ValueError(
-                    "`memory_keyframe_video` shape mismatch: "
-                    f"got {tuple(memory_keyframe_video.shape)}, expected B={batch_size}, C=3."
+                    "`memory_block_video` shape mismatch: "
+                    f"got {tuple(memory_block_video.shape)}, expected B={batch_size}, C=3."
                 )
-            memory_keyframe_video = memory_keyframe_video.to(
+            memory_block_video = memory_block_video.to(
                 device=self.device,
                 dtype=self.torch_dtype,
                 non_blocking=True,
             )
-            if memory_keyframe_mask is None:
-                memory_keyframe_mask = torch.ones(
-                    memory_keyframe_video.shape[:2],
+            if memory_block_mask is None:
+                memory_block_mask = torch.ones(
+                    memory_block_video.shape[:2],
                     dtype=torch.bool,
                     device=self.device,
                 )
             else:
-                memory_keyframe_mask = memory_keyframe_mask.to(
+                memory_block_mask = memory_block_mask.to(
                     device=self.device,
                     dtype=torch.bool,
                     non_blocking=True,
                 )
-            if memory_keyframe_mask.shape != memory_keyframe_video.shape[:2]:
+            if memory_block_mask.shape != memory_block_video.shape[:2]:
                 raise ValueError(
-                    "`memory_keyframe_mask` shape mismatch: "
-                    f"got {tuple(memory_keyframe_mask.shape)} vs expected {tuple(memory_keyframe_video.shape[:2])}"
+                    "`memory_block_mask` shape mismatch: "
+                    f"got {tuple(memory_block_mask.shape)} vs expected {tuple(memory_block_video.shape[:2])}"
                 )
-            if memory_keyframe_steps is not None:
-                memory_keyframe_steps = memory_keyframe_steps.to(
+            if memory_block_steps is not None:
+                memory_block_steps = memory_block_steps.to(
                     device=self.device,
                     dtype=torch.long,
                     non_blocking=True,
                 )
+            if memory_block_source is not None:
+                memory_block_source = memory_block_source.to(
+                    device=self.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+                if memory_block_source.shape != memory_block_video.shape[:2]:
+                    raise ValueError(
+                        "`memory_block_source` shape mismatch: "
+                        f"got {tuple(memory_block_source.shape)} vs expected {tuple(memory_block_video.shape[:2])}"
+                    )
+            if memory_block_offsets is not None:
+                memory_block_offsets = memory_block_offsets.to(
+                    device=self.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+                if memory_block_offsets.shape != memory_block_video.shape[:2]:
+                    raise ValueError(
+                        "`memory_block_offsets` shape mismatch: "
+                        f"got {tuple(memory_block_offsets.shape)} vs expected {tuple(memory_block_video.shape[:2])}"
+                    )
 
         chunk_keyframe_target = sample.get("chunk_keyframe_target", None)
         if chunk_keyframe_target is not None:
@@ -508,10 +571,16 @@ class FastWAM(torch.nn.Module):
             "action": action,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
-            "memory_keyframe_video": memory_keyframe_video,
-            "memory_keyframe_mask": memory_keyframe_mask,
-            "memory_keyframe_steps": memory_keyframe_steps,
-            "memory_keyframe_count": sample.get("memory_keyframe_count", None),
+            "memory_block_video": memory_block_video,
+            "memory_block_mask": memory_block_mask,
+            "memory_block_steps": memory_block_steps,
+            "memory_block_source": memory_block_source,
+            "memory_block_offsets": memory_block_offsets,
+            "memory_block_count": sample.get("memory_block_count", sample.get("memory_keyframe_count", None)),
+            "memory_keyframe_video": memory_block_video,
+            "memory_keyframe_mask": memory_block_mask,
+            "memory_keyframe_steps": memory_block_steps,
+            "memory_keyframe_count": sample.get("memory_keyframe_count", sample.get("memory_block_count", None)),
             "chunk_keyframe_target": chunk_keyframe_target,
             "use_keyframe_supervision": use_keyframe_supervision,
             "teacher_event_offset": sample.get("teacher_event_offset", None),
@@ -550,11 +619,6 @@ class FastWAM(torch.nn.Module):
             mask[video_seq_len:, :first_frame_tokens] = True
             return mask
 
-        if memory_seq_len % video_tokens_per_frame != 0:
-            raise ValueError(
-                "`memory_seq_len` must be divisible by `video_tokens_per_frame`, "
-                f"got {memory_seq_len} and {video_tokens_per_frame}."
-            )
         normal_video_seq_len = video_seq_len - memory_seq_len
         if normal_video_seq_len <= 0:
             raise ValueError(
@@ -602,6 +666,8 @@ class FastWAM(torch.nn.Module):
         video_pre: dict[str, Any],
         memory_keyframe_video: Optional[torch.Tensor],
         memory_keyframe_mask: Optional[torch.Tensor],
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
         tiled: bool = False,
     ) -> dict[str, Any]:
         if (
@@ -613,6 +679,16 @@ class FastWAM(torch.nn.Module):
                 "memory_seq_len": 0,
                 "memory_token_mask": None,
             }
+
+        if self.keyframe_memory_structured_block:
+            return self._prefix_memory_block_tokens(
+                video_pre=video_pre,
+                memory_block_video=memory_keyframe_video,
+                memory_block_mask=memory_keyframe_mask,
+                memory_block_source=memory_block_source,
+                memory_block_offsets=memory_block_offsets,
+                tiled=tiled,
+            )
 
         if memory_keyframe_mask is None:
             memory_keyframe_mask = torch.ones(
@@ -676,6 +752,253 @@ class FastWAM(torch.nn.Module):
         memory_token_mask = memory_keyframe_mask.repeat_interleave(tokens_per_frame, dim=1)
         return {
             "memory_seq_len": memory_seq_len,
+            "memory_token_mask": memory_token_mask,
+        }
+
+    def _memory_freqs_for_offsets(
+        self,
+        offsets: torch.Tensor,
+        h: int,
+        w: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if offsets.ndim != 2:
+            raise ValueError(f"`offsets` must be [B,K], got {tuple(offsets.shape)}")
+        batch_size, num_frames = offsets.shape
+        temporal_cache, height_cache, width_cache = self.video_expert.freqs
+        max_temporal_index = int(temporal_cache.shape[0]) - 1
+        max_relative = int(self.relative_memory_rope_max_offset)
+        if max_relative > 0:
+            offsets = offsets.clamp(min=-max_relative, max=0)
+        else:
+            offsets = offsets.clamp(max=0)
+        abs_offsets = offsets.abs().clamp(max=max_temporal_index).long().to(device=temporal_cache.device)
+        temporal_freqs = temporal_cache[abs_offsets].to(device=device)
+        temporal_freqs = torch.where(
+            offsets.to(device=device).unsqueeze(-1) < 0,
+            temporal_freqs.conj(),
+            temporal_freqs,
+        )
+        temporal_freqs = temporal_freqs.view(batch_size, num_frames, 1, 1, -1).expand(
+            batch_size, num_frames, h, w, -1
+        )
+        height_freqs = height_cache[:h].to(device=device).view(1, 1, h, 1, -1).expand(
+            batch_size, num_frames, h, w, -1
+        )
+        width_freqs = width_cache[:w].to(device=device).view(1, 1, 1, w, -1).expand(
+            batch_size, num_frames, h, w, -1
+        )
+        return torch.cat([temporal_freqs, height_freqs, width_freqs], dim=-1).reshape(
+            batch_size,
+            num_frames * h * w,
+            1,
+            -1,
+        )
+
+    def _prefix_memory_block_tokens(
+        self,
+        video_pre: dict[str, Any],
+        memory_block_video: torch.Tensor,
+        memory_block_mask: Optional[torch.Tensor],
+        memory_block_source: Optional[torch.Tensor],
+        memory_block_offsets: Optional[torch.Tensor],
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        if memory_block_mask is None:
+            memory_block_mask = torch.ones(
+                memory_block_video.shape[:2],
+                dtype=torch.bool,
+                device=memory_block_video.device,
+            )
+        if not bool(memory_block_mask.any().item()):
+            return {
+                "memory_seq_len": 0,
+                "keyframe_seq_len": 0,
+                "recent_seq_len": 0,
+                "memory_bos_seq_len": 0,
+                "recent_bos_seq_len": 0,
+                "memory_token_mask": None,
+            }
+
+        batch_size, num_slots, channels, height, width = memory_block_video.shape
+        if channels != 3:
+            raise ValueError(f"`memory_block_video` channel dim must be 3, got {channels}.")
+        if batch_size != video_pre["tokens"].shape[0]:
+            raise ValueError(
+                "`memory_block_video` batch mismatch: "
+                f"{batch_size} vs video tokens batch {video_pre['tokens'].shape[0]}."
+            )
+        if memory_block_source is not None and memory_block_source.shape != memory_block_mask.shape:
+            raise ValueError(
+                "`memory_block_source` shape mismatch: "
+                f"{tuple(memory_block_source.shape)} vs {tuple(memory_block_mask.shape)}"
+            )
+        if memory_block_offsets is not None and memory_block_offsets.shape != memory_block_mask.shape:
+            raise ValueError(
+                "`memory_block_offsets` shape mismatch: "
+                f"{tuple(memory_block_offsets.shape)} vs {tuple(memory_block_mask.shape)}"
+            )
+
+        memory_flat = memory_block_video.reshape(batch_size * num_slots, channels, height, width)
+        memory_flat = memory_flat.unsqueeze(2)
+        memory_latents_flat = self._encode_video_latents(memory_flat, tiled=tiled)
+        if memory_latents_flat.shape[2] != 1:
+            raise ValueError(
+                "Single-frame memory VAE encode must produce one latent frame, "
+                f"got {memory_latents_flat.shape[2]}."
+            )
+        latent_channels = int(memory_latents_flat.shape[1])
+        latent_h = int(memory_latents_flat.shape[3])
+        latent_w = int(memory_latents_flat.shape[4])
+        memory_latents = memory_latents_flat[:, :, 0].reshape(
+            batch_size,
+            num_slots,
+            latent_channels,
+            latent_h,
+            latent_w,
+        ).permute(0, 2, 1, 3, 4).contiguous()
+
+        memory_patch = self.video_expert.patchify(memory_latents)
+        _, hidden_dim, patched_slots, patch_h, patch_w = memory_patch.shape
+        memory_slot_tokens = memory_patch.permute(0, 2, 3, 4, 1).reshape(
+            batch_size,
+            patched_slots,
+            patch_h * patch_w,
+            hidden_dim,
+        )
+        if patched_slots != num_slots:
+            raise ValueError(
+                "Memory patchify changed the number of memory frames: "
+                f"got {patched_slots}, expected {num_slots}."
+            )
+        tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        if tokens_per_frame != patch_h * patch_w:
+            raise ValueError(
+                "Memory tokens-per-frame mismatch: "
+                f"got {patch_h * patch_w}, expected {tokens_per_frame}."
+            )
+
+        if memory_block_source is None:
+            keyframe_slot_layout = torch.ones((num_slots,), dtype=torch.bool, device=memory_block_mask.device)
+            recent_slot_layout = torch.zeros((num_slots,), dtype=torch.bool, device=memory_block_mask.device)
+            keyframe_slot_mask = memory_block_mask
+            recent_slot_mask = torch.zeros_like(memory_block_mask)
+        else:
+            is_keyframe = (
+                (memory_block_source == MEMORY_SOURCE_KEYFRAME_TEACHER)
+                | (memory_block_source == MEMORY_SOURCE_KEYFRAME_PREDICTED)
+            ) & memory_block_mask
+            is_recent = (memory_block_source == MEMORY_SOURCE_HISTORY) & memory_block_mask
+            keyframe_slot_layout = is_keyframe.any(dim=0)
+            recent_slot_layout = is_recent.any(dim=0)
+            keyframe_slot_mask = is_keyframe
+            recent_slot_mask = is_recent
+
+        first_frame_freqs = video_pre["freqs"][:tokens_per_frame]
+        batched_freqs = bool(self.use_relative_memory_rope and memory_block_offsets is not None)
+        first_frame_t_mod = video_pre["t_mod"][:, :tokens_per_frame]
+        first_frame_context_mask = video_pre["context_mask"][:, :tokens_per_frame]
+
+        token_pieces: list[torch.Tensor] = []
+        freq_pieces: list[torch.Tensor] = []
+        t_mod_pieces: list[torch.Tensor] = []
+        context_mask_pieces: list[torch.Tensor] = []
+        mask_pieces: list[torch.Tensor] = []
+        keyframe_seq_len = 0
+        recent_seq_len = 0
+        memory_bos_seq_len = 0
+        recent_bos_seq_len = 0
+
+        def add_bos(token: torch.Tensor, active_mask: torch.Tensor) -> tuple[int, int]:
+            bos = token.to(device=memory_block_video.device, dtype=memory_slot_tokens.dtype).expand(batch_size, 1, -1)
+            token_pieces.append(bos)
+            if batched_freqs:
+                freq_pieces.append(first_frame_freqs[:1].unsqueeze(0).expand(batch_size, -1, -1, -1))
+            else:
+                freq_pieces.append(first_frame_freqs[:1])
+            t_mod_pieces.append(video_pre["t_mod"][:, :1])
+            context_mask_pieces.append(video_pre["context_mask"][:, :1])
+            mask_pieces.append(active_mask)
+            return 1, 1
+
+        def add_visual_slots(slot_layout: torch.Tensor, slot_mask: torch.Tensor) -> int:
+            slot_count = int(slot_layout.sum().item())
+            if slot_count == 0:
+                return 0
+            tokens = memory_slot_tokens[:, slot_layout].reshape(batch_size, slot_count * tokens_per_frame, hidden_dim)
+            token_pieces.append(tokens)
+            if batched_freqs:
+                offsets = memory_block_offsets[:, slot_layout]
+                freq_pieces.append(
+                    self._memory_freqs_for_offsets(
+                        offsets=offsets,
+                        h=patch_h,
+                        w=patch_w,
+                        device=memory_block_video.device,
+                    )
+                )
+            else:
+                freq_pieces.append(first_frame_freqs.repeat(slot_count, 1, 1))
+            t_mod_pieces.append(
+                first_frame_t_mod.unsqueeze(1)
+                .expand(batch_size, slot_count, tokens_per_frame, 6, int(self.video_expert.hidden_dim))
+                .reshape(batch_size, slot_count * tokens_per_frame, 6, int(self.video_expert.hidden_dim))
+            )
+            context_mask_pieces.append(
+                first_frame_context_mask.unsqueeze(1)
+                .expand(batch_size, slot_count, tokens_per_frame, first_frame_context_mask.shape[-1])
+                .reshape(batch_size, slot_count * tokens_per_frame, first_frame_context_mask.shape[-1])
+            )
+            mask_pieces.append(slot_mask[:, slot_layout].repeat_interleave(tokens_per_frame, dim=1))
+            return slot_count * tokens_per_frame
+
+        keyframe_active = keyframe_slot_mask[:, keyframe_slot_layout].any(dim=1, keepdim=True) if bool(keyframe_slot_layout.any().item()) else torch.zeros((batch_size, 1), dtype=torch.bool, device=memory_block_mask.device)
+        if bool(keyframe_slot_layout.any().item()):
+            if self.use_memory_bos:
+                active = keyframe_active | bool(self.memory_bos_insert_when_empty)
+                memory_bos_seq_len, added = add_bos(self.memory_bos_token, active)
+                keyframe_seq_len += added
+            keyframe_seq_len += add_visual_slots(keyframe_slot_layout, keyframe_slot_mask)
+
+        recent_active = recent_slot_mask[:, recent_slot_layout].any(dim=1, keepdim=True) if bool(recent_slot_layout.any().item()) else torch.zeros((batch_size, 1), dtype=torch.bool, device=memory_block_mask.device)
+        if bool(recent_slot_layout.any().item()):
+            if self.use_recent_bos:
+                active = recent_active | bool(self.recent_bos_insert_when_empty)
+                recent_bos_seq_len, added = add_bos(self.recent_bos_token, active)
+                recent_seq_len += added
+            recent_seq_len += add_visual_slots(recent_slot_layout, recent_slot_mask)
+
+        if not token_pieces:
+            return {
+                "memory_seq_len": 0,
+                "keyframe_seq_len": 0,
+                "recent_seq_len": 0,
+                "memory_bos_seq_len": 0,
+                "recent_bos_seq_len": 0,
+                "memory_token_mask": None,
+            }
+
+        memory_tokens = torch.cat(token_pieces, dim=1)
+        if batched_freqs:
+            normal_freqs = video_pre["freqs"].unsqueeze(0).expand(batch_size, -1, -1, -1)
+        else:
+            normal_freqs = video_pre["freqs"]
+        memory_freqs = torch.cat(freq_pieces, dim=1 if batched_freqs else 0)
+        memory_t_mod = torch.cat(t_mod_pieces, dim=1)
+        memory_context_mask = torch.cat(context_mask_pieces, dim=1)
+        memory_token_mask = torch.cat(mask_pieces, dim=1).to(device=memory_block_video.device, dtype=torch.bool)
+
+        video_pre["tokens"] = torch.cat([memory_tokens, video_pre["tokens"]], dim=1)
+        video_pre["freqs"] = torch.cat([memory_freqs, normal_freqs], dim=1 if batched_freqs else 0)
+        video_pre["t_mod"] = torch.cat([memory_t_mod, video_pre["t_mod"]], dim=1)
+        video_pre["context_mask"] = torch.cat([memory_context_mask, video_pre["context_mask"]], dim=1)
+
+        return {
+            "memory_seq_len": int(memory_tokens.shape[1]),
+            "keyframe_seq_len": int(keyframe_seq_len),
+            "recent_seq_len": int(recent_seq_len),
+            "memory_bos_seq_len": int(memory_bos_seq_len),
+            "recent_bos_seq_len": int(recent_bos_seq_len),
             "memory_token_mask": memory_token_mask,
         }
 
@@ -959,8 +1282,10 @@ class FastWAM(torch.nn.Module):
         action_tokens = action_pre["tokens"]
         memory_info = self._prefix_memory_video_tokens(
             video_pre=video_pre,
-            memory_keyframe_video=inputs.get("memory_keyframe_video"),
-            memory_keyframe_mask=inputs.get("memory_keyframe_mask"),
+            memory_keyframe_video=inputs.get("memory_block_video"),
+            memory_keyframe_mask=inputs.get("memory_block_mask"),
+            memory_block_source=inputs.get("memory_block_source"),
+            memory_block_offsets=inputs.get("memory_block_offsets"),
             tiled=tiled,
         )
         video_tokens = video_pre["tokens"]
@@ -1071,6 +1396,8 @@ class FastWAM(torch.nn.Module):
         gt_action: Optional[torch.Tensor] = None,
         memory_keyframe_video: Optional[torch.Tensor] = None,
         memory_keyframe_mask: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
         tiled: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
@@ -1091,6 +1418,8 @@ class FastWAM(torch.nn.Module):
             video_pre=video_pre,
             memory_keyframe_video=memory_keyframe_video,
             memory_keyframe_mask=memory_keyframe_mask,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
             tiled=tiled,
         )
 
@@ -1271,6 +1600,54 @@ class FastWAM(torch.nn.Module):
             )
         return memory_keyframe_video, memory_keyframe_mask
 
+    def _prepare_inference_memory_block(
+        self,
+        memory_block_video: Optional[torch.Tensor] = None,
+        memory_block_mask: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
+        memory_keyframe_video: Optional[torch.Tensor] = None,
+        memory_keyframe_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        memory_video = memory_block_video if memory_block_video is not None else memory_keyframe_video
+        memory_mask = memory_block_mask if memory_block_mask is not None else memory_keyframe_mask
+        memory_video, memory_mask = self._prepare_inference_memory_keyframes(memory_video, memory_mask)
+        if memory_video is None:
+            return None, None, None, None
+
+        if memory_block_source is not None:
+            if memory_block_source.ndim == 1:
+                memory_block_source = memory_block_source.unsqueeze(0)
+            if memory_block_source.shape != memory_video.shape[:2]:
+                raise ValueError(
+                    "`memory_block_source` shape mismatch: "
+                    f"{tuple(memory_block_source.shape)} vs {tuple(memory_video.shape[:2])}"
+                )
+            memory_block_source = memory_block_source.to(
+                device=self.device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+        if memory_block_offsets is not None:
+            if memory_block_offsets.ndim == 1:
+                memory_block_offsets = memory_block_offsets.unsqueeze(0)
+            if memory_block_offsets.shape != memory_video.shape[:2]:
+                raise ValueError(
+                    "`memory_block_offsets` shape mismatch: "
+                    f"{tuple(memory_block_offsets.shape)} vs {tuple(memory_video.shape[:2])}"
+                )
+            memory_block_offsets = memory_block_offsets.to(
+                device=self.device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+        return memory_video, memory_mask, memory_block_source, memory_block_offsets
+
     @torch.no_grad()
     def infer_joint(
         self,
@@ -1293,11 +1670,20 @@ class FastWAM(torch.nn.Module):
         memory_keyframe_video: Optional[torch.Tensor] = None,
         memory_keyframe_mask: Optional[torch.Tensor] = None,
         memory_keyframe_steps: Optional[torch.Tensor] = None,
+        memory_block_video: Optional[torch.Tensor] = None,
+        memory_block_mask: Optional[torch.Tensor] = None,
+        memory_block_steps: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
-        memory_keyframe_video, memory_keyframe_mask = self._prepare_inference_memory_keyframes(
-            memory_keyframe_video,
-            memory_keyframe_mask,
+        memory_keyframe_video, memory_keyframe_mask, memory_block_source, memory_block_offsets = self._prepare_inference_memory_block(
+            memory_block_video=memory_block_video,
+            memory_block_mask=memory_block_mask,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
+            memory_keyframe_video=memory_keyframe_video,
+            memory_keyframe_mask=memory_keyframe_mask,
         )
         action_only_pred = None
         if test_action_with_infer_action:
@@ -1318,6 +1704,8 @@ class FastWAM(torch.nn.Module):
                 memory_keyframe_video=memory_keyframe_video.clone() if memory_keyframe_video is not None else None,
                 memory_keyframe_mask=memory_keyframe_mask.clone() if memory_keyframe_mask is not None else None,
                 memory_keyframe_steps=memory_keyframe_steps.clone() if memory_keyframe_steps is not None else None,
+                memory_block_source=memory_block_source.clone() if memory_block_source is not None else None,
+                memory_block_offsets=memory_block_offsets.clone() if memory_block_offsets is not None else None,
             )
             action_only_out = action_only_pred["action"]
         
@@ -1444,6 +1832,8 @@ class FastWAM(torch.nn.Module):
                 gt_action=action,
                 memory_keyframe_video=memory_keyframe_video,
                 memory_keyframe_mask=memory_keyframe_mask,
+                memory_block_source=memory_block_source,
+                memory_block_offsets=memory_block_offsets,
                 tiled=tiled,
             )
             pred_video = pred_video_posi
@@ -1495,15 +1885,24 @@ class FastWAM(torch.nn.Module):
         memory_keyframe_video: Optional[torch.Tensor] = None,
         memory_keyframe_mask: Optional[torch.Tensor] = None,
         memory_keyframe_steps: Optional[torch.Tensor] = None,
+        memory_block_video: Optional[torch.Tensor] = None,
+        memory_block_mask: Optional[torch.Tensor] = None,
+        memory_block_steps: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
                 "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
             )
-        memory_keyframe_video, memory_keyframe_mask = self._prepare_inference_memory_keyframes(
-            memory_keyframe_video,
-            memory_keyframe_mask,
+        memory_keyframe_video, memory_keyframe_mask, memory_block_source, memory_block_offsets = self._prepare_inference_memory_block(
+            memory_block_video=memory_block_video,
+            memory_block_mask=memory_block_mask,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
+            memory_keyframe_video=memory_keyframe_video,
+            memory_keyframe_mask=memory_keyframe_mask,
         )
 
         if input_image.ndim == 3:
@@ -1588,6 +1987,8 @@ class FastWAM(torch.nn.Module):
             video_pre=video_pre,
             memory_keyframe_video=memory_keyframe_video,
             memory_keyframe_mask=memory_keyframe_mask,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
             tiled=tiled,
         )
         video_seq_len = int(video_pre["tokens"].shape[1])
@@ -1678,6 +2079,11 @@ class FastWAM(torch.nn.Module):
         memory_keyframe_video: Optional[torch.Tensor] = None,
         memory_keyframe_mask: Optional[torch.Tensor] = None,
         memory_keyframe_steps: Optional[torch.Tensor] = None,
+        memory_block_video: Optional[torch.Tensor] = None,
+        memory_block_mask: Optional[torch.Tensor] = None,
+        memory_block_steps: Optional[torch.Tensor] = None,
+        memory_block_source: Optional[torch.Tensor] = None,
+        memory_block_offsets: Optional[torch.Tensor] = None,
     ):
         return self.infer_joint(
             prompt=prompt,
@@ -1698,6 +2104,11 @@ class FastWAM(torch.nn.Module):
             memory_keyframe_video=memory_keyframe_video,
             memory_keyframe_mask=memory_keyframe_mask,
             memory_keyframe_steps=memory_keyframe_steps,
+            memory_block_video=memory_block_video,
+            memory_block_mask=memory_block_mask,
+            memory_block_steps=memory_block_steps,
+            memory_block_source=memory_block_source,
+            memory_block_offsets=memory_block_offsets,
         )
 
     def save_checkpoint(self, path, optimizer=None, step=None):
@@ -1708,6 +2119,10 @@ class FastWAM(torch.nn.Module):
             "kem_config": self.kem_config,
             "keyframe_memory_config": self.keyframe_memory_config,
         }
+        if hasattr(self, "memory_bos_token"):
+            payload["memory_bos_token"] = self.memory_bos_token.detach().cpu()
+        if hasattr(self, "recent_bos_token"):
+            payload["recent_bos_token"] = self.recent_bos_token.detach().cpu()
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
         if self.kem_head is not None:
@@ -1739,6 +2154,25 @@ class FastWAM(torch.nn.Module):
                 logger.warning("Checkpoint has no `kem_head` weights; keeping current `kem_head` params.")
         elif "kem_head" in payload:
             logger.warning("Checkpoint contains `kem_head` weights but current model has KEM disabled; ignoring.")
+
+        for param_name in ("memory_bos_token", "recent_bos_token"):
+            param = getattr(self, param_name, None)
+            if not isinstance(param, torch.nn.Parameter):
+                continue
+            if param_name in payload:
+                value = payload[param_name].to(device=param.device, dtype=param.dtype)
+                if value.shape != param.shape:
+                    raise ValueError(
+                        f"Checkpoint `{param_name}` shape mismatch: "
+                        f"{tuple(value.shape)} vs current {tuple(param.shape)}."
+                    )
+                with torch.no_grad():
+                    param.copy_(value)
+            elif self.keyframe_memory_enabled and (
+                (param_name == "memory_bos_token" and self.use_memory_bos)
+                or (param_name == "recent_bos_token" and self.use_recent_bos)
+            ):
+                logger.warning("Checkpoint has no `%s`; keeping current initialized value.", param_name)
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
