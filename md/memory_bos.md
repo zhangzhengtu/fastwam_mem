@@ -1,5 +1,19 @@
 # FastWAM 结构化 Memory Block + Memory BOS 方案
 
+## 当前代码版本校准（2026-07-15）
+
+本文件原本是结构化 memory block 的设计文档。按当前代码版本，以下内容已经是实现事实，而不再只是建议：
+
+- 主输入字段已经是 `memory_block_video/mask/steps/source/offsets/count`；旧的 `memory_keyframe_*` 字段仍保留为兼容 alias。
+- `memory_block_source` 的 source id 已落地：`PAD=0`、`HISTORY=1`、`KEYFRAME_TEACHER=2`、`KEYFRAME_PREDICTED=3`。
+- 数据侧 `RobotVideoDataset._build_memory_block()` 固定 slot 分区：前 `max_keyframe_slots` 个 slot 放 teacher keyframe，后 `max_recent_slots` 个 slot 放 `history_step_offsets` 对应的 recent history。
+- 推理侧 `experiments/robotwin_mem/fastwam_policy/deploy_policy.py::_memory_block_tensors()` 固定同样分区：predicted keyframe 在前，recent history 在后。
+- 模型侧 `FastWAM._prefix_memory_block_tokens()` 已实现 `[MEM_BOS][keyframe visual][RECENT_BOS][recent visual]`，并返回 `spans`，用于 attention probe。
+- 当前 `configs/model/fastwam*.yaml` 默认 `structured_block: true`、`use_memory_bos: true`、`use_recent_bos: true`、`use_relative_memory_rope: true`。
+- relative memory RoPE 已实现：当 `use_relative_memory_rope=true` 且传入 `memory_block_offsets` 时，visual memory tokens 使用相对 offset；BOS token 仍复用 first-frame 的单 token freqs。
+- attention mask 已支持 batch-wise `memory_token_mask`，padding memory key/query 会逐样本屏蔽；没有任何有效 memory 时不插入 memory prefix。
+- attention 可视化已经能记录/绘制 action 到 keyframe00-03、recent00-01、current visual 的 raw attention mass 和 `attention @ V` contribution。
+
 ## 目标
 
 当前 FastWAM 已经支持把 `memory_keyframe_video` 作为 video prefix tokens 注入 MoT：历史关键帧或历史帧会和当前帧一样经过 VAE encode、`video_expert.patchify()`，再拼到普通 video tokens 前面。这个做法简单有效，但所有 memory tokens 都混在同一个 prefix 里，模型只能通过位置和训练分布隐式地区分：
@@ -71,7 +85,7 @@ source embedding 的作用是给 token 加身份标签，例如 `history`、`key
 
 ## 数据字段设计
 
-建议把当前 `memory_keyframe_*` 字段逐步改名为更通用的 `memory_block_*`。为了兼容旧代码，可以先同时保留旧字段名。
+当前已经把主字段改为更通用的 `memory_block_*`。为了兼容旧代码，仍同时保留旧字段名 `memory_keyframe_*`，但旧字段现在只是 alias，内容可能同时包含 keyframe 和 recent-history。
 
 ### 新字段
 
@@ -104,7 +118,7 @@ keyframe slots: [0, max_keyframe_slots)
 recent slots: [max_keyframe_slots, max_keyframe_slots + max_recent_slots)
 ```
 
-如果继续使用单个 `memory_block_video`，则 `memory_block_source` 必须能唯一标出每个 slot 属于 keyframe 还是 recent。更清晰的实现也可以拆成两组字段：
+当前实现继续使用单个 `memory_block_video`，并通过 `memory_block_source` 唯一标出每个 slot 属于 keyframe 还是 recent。另一种拆成两组字段的设计目前没有采用：
 
 ```python
 memory_keyframe_video: [B, K_key, 3, H, W]
@@ -324,21 +338,24 @@ memory_tokens = torch.cat(pieces, dim=1)
 video_pre["tokens"] = torch.cat([memory_tokens, video_pre["tokens"]], dim=1)
 ```
 
-如果一个 batch 中某个 sample 没有 keyframe，但另一个 sample 有 keyframe，仍然建议在 batch 维度保留固定 layout：
+当前实现不是无条件保留全量 `max_keyframes + max_recent_slots` 的 token layout，而是按 batch 内“至少一个 sample 有效”的 slot layout 生成 token：
 
 ```text
 [MEM_BOS][K_keyframe slots][RECENT_BOS][K_recent slots]
 ```
 
-没有对应 memory 的 sample 通过 `memory_token_mask` mask 掉 BOS 和 visual tokens。这样 batch 内 token shape 稳定。
+如果 batch 内某个 keyframe/recent slot 对至少一个 sample 有效，该 slot 的 visual tokens 会进入序列；对没有对应 memory 的 sample，通过 `memory_token_mask` mask 掉 BOS 和 visual tokens。这样 batch 内 shape 稳定，同时避免把所有完全空的 padding slots 都放进 attention。
 
 ## 3D RoPE 设计
 
-当前 FastWAM memory prefix 逻辑把 memory frame 的 RoPE temporal index 固定为 current first frame 的 0。这对“memory 只是额外条件图”是稳定的，但对于结构化 memory block，建议升级为：
+当前实现分两种路径：
+
+- `use_relative_memory_rope=false` 或未传 `memory_block_offsets`：memory visual tokens 复制 current first frame 的 freqs，相当于 temporal index 固定为 0。
+- `use_relative_memory_rope=true` 且传入 `memory_block_offsets`：memory visual tokens 使用 `memory_step - current_step` 的相对 offset，并 clamp 到 `[-relative_memory_rope_max_offset, 0]`；负 offset 会使用 temporal freqs 的 conjugate，表达历史方向。
+
+因此结构化 memory block 当前已经支持 relative temporal RoPE，语义是：
 
 ```text
-MEM_BOS: 使用 keyframe memory marker 坐标
-RECENT_BOS: 使用 recent-history marker 坐标
 history t-10: temporal index = -10 或离散 bucket
 history t-5: temporal index = -5 或离散 bucket
 keyframe: temporal index = clamp(keyframe_step - current_step)
@@ -346,28 +363,9 @@ current frame: temporal index = 0
 future noisy video: 保持原 video_pre 的时间索引
 ```
 
-### 最小稳定版
+`MEM_BOS` 和 `RECENT_BOS` 当前没有单独的 marker coordinate；它们复用 first-frame 的单 token freqs。相对时间信息主要落在 full visual memory tokens 上。
 
-为了不大改 RoPE 生成代码，第一版可以：
-
-- `MEM_BOS` 和 `RECENT_BOS` 都复制 current first-frame 的第一个 token RoPE。
-- 所有 memory full tokens 继续复制 current first-frame RoPE。
-- 通过 attention mask 和两个 BOS 先完成结构分离。
-
-这是最稳的 warm start 方式。
-
-### 推荐增强版
-
-后续再加 relative temporal RoPE：
-
-```python
-relative_t = memory_block_offsets
-relative_t = clamp(relative_t, min=-max_history, max=0)
-```
-
-然后为每个 memory frame 生成对应 temporal coordinate。这样 `t-10`、`t-5`、keyframe 不只靠顺序区分，还能在 positional space 中区分。
-
-如果当前 `video_expert.freqs` 生成接口不支持负时间索引，可以先做 bucket：
+历史设计里提到的 bucket 方案目前没有采用：
 
 ```text
 bucket 0: MEM_BOS
@@ -378,7 +376,7 @@ bucket 4: history -5
 bucket 5: current
 ```
 
-但从语义上，relative temporal index 更接近 MemoryWAM。
+当前实现选择 relative temporal index，更接近 MemoryWAM。
 
 ## Attention Mask 设计
 
@@ -398,7 +396,7 @@ token 排列：
 [MEM_BOS][keyframe tokens][RECENT_BOS][recent tokens][normal video V][action A]
 ```
 
-推荐第一版 mask：
+当前第一版 mask：
 
 ### memory block 内部
 
@@ -410,10 +408,10 @@ recent visual tokens 可以看 RECENT_BOS 和同一个 recent frame 内 tokens
 padding memory tokens 不可见
 ```
 
-为了实现简单，也可以第一版让有效 memory block 内部全可见，但仍保持两个 BOS 的位置边界：
+当前实现让有效 condition block 内部全可见，condition block 包含 memory prefix 和 current first-frame tokens：
 
 ```python
-mask[:M, :M] = valid_memory_token_mask
+mask[:condition_end, :condition_end] = True
 ```
 
 ### current first frame
@@ -469,22 +467,22 @@ memory_token_mask = torch.cat(
 )
 ```
 
-如果一个 sample 没有任何 memory：
+如果整个 batch 没有任何有效 memory：
 
-- 可以不插入 `MEM_BOS` 和 `RECENT_BOS`，`memory_seq_len=0`。
-- 或保留固定 layout，但 mask 掉对应 BOS 和 visual tokens。
+- 不插入 `MEM_BOS` 和 `RECENT_BOS`，`memory_seq_len=0`。
 
-建议第一版如果要最小改动：**没有任何有效 memory 时不插入两个 BOS**。如果要 batch shape 最稳定，则始终保留固定 layout，并用 mask 控制每个 sample 的有效性。
+如果 batch 内有其他 sample 含有效 memory，而某个 sample 没有对应 keyframe/recent，则该 sample 的 BOS 和 visual tokens 会通过 `memory_token_mask` 屏蔽；代码还给 invalid memory query 保留到 current first token 的兜底可见边，避免全 mask query。
 
 ## 推理侧 RoboTwin-Mem 设计
 
-当前 `deploy_policy.py` 里已经有：
+当前 `experiments/robotwin_mem/fastwam_policy/deploy_policy.py` 里已经有：
 
 - `history_observation_bank`
 - `memory_bank`
-- `_memory_tensors()`
+- `_memory_block_tensors()`
+- `_memory_tensors()` 旧兼容路径
 
-建议改为 `_memory_block_tensors()`，返回：
+当前主路径是 `_memory_block_tensors()`，返回：
 
 ```python
 memory_block_video
@@ -494,7 +492,7 @@ memory_block_source
 memory_block_offsets
 ```
 
-推理时构造顺序：
+推理时构造顺序已经按下面逻辑实现：
 
 1. 从 predicted keyframe `memory_bank` 取 keyframe slots：
 
@@ -519,7 +517,7 @@ infer_action(..., memory_block_video=..., memory_block_mask=..., ...)
 infer_joint(..., memory_block_video=..., memory_block_mask=..., ...)
 ```
 
-为了兼容旧 checkpoint/旧函数签名，可以保留：
+为了兼容旧 checkpoint/旧函数签名，当前代码保留：
 
 ```python
 if "memory_block_video" in infer_params:
@@ -550,17 +548,17 @@ keyframe_memory:
 
 旧字段可以继续兼容。
 
-## 实现步骤
+## 当前实现入口
 
 ### Step 1. 数据侧
 
-修改：
+已修改：
 
 ```text
 src/fastwam/datasets/lerobot/robot_video_dataset.py
 ```
 
-新增：
+当前入口：
 
 ```python
 _build_memory_block()
@@ -570,13 +568,13 @@ _build_memory_block()
 
 ### Step 2. 推理 adapter
 
-修改：
+已修改：
 
 ```text
 experiments/robotwin_mem/fastwam_policy/deploy_policy.py
 ```
 
-新增：
+当前入口：
 
 ```python
 _memory_block_tensors()
@@ -586,7 +584,7 @@ _memory_block_tensors()
 
 ### Step 3. 模型输入
 
-修改：
+已修改：
 
 ```text
 src/fastwam/models/wan22/fastwam.py
@@ -594,7 +592,7 @@ src/fastwam/models/wan22/fastwam_idm.py
 src/fastwam/models/wan22/fastwam_joint.py
 ```
 
-新增：
+当前入口：
 
 ```python
 self.memory_bos_token
@@ -602,17 +600,17 @@ self.recent_bos_token
 _prefix_memory_block_tokens()
 ```
 
-旧 `_prefix_memory_video_tokens()` 可以包装新函数，降低改动面。
+旧 `_prefix_memory_video_tokens()` 当前作为兼容路径保留；当 `structured_block=true` 时会走 `_prefix_memory_block_tokens()`。
 
 ### Step 4. Attention mask
 
-修改：
+已修改：
 
 ```python
 _build_mot_attention_mask()
 ```
 
-新增参数：
+当前参数：
 
 ```python
 memory_bos_seq_len: int = 0
@@ -622,7 +620,7 @@ recent_seq_len: int = 0
 memory_token_mask: Optional[torch.Tensor] = None
 ```
 
-第一版可以把整个有效 memory block 当作 condition block：
+当前第一版把整个有效 memory block 当作 condition block：
 
 ```text
 condition = keyframe block + recent-history block + current first frame
@@ -632,7 +630,7 @@ future video attends keyframe/recent blocks
 
 ### Step 5. 配置
 
-修改：
+已修改：
 
 ```text
 configs/model/fastwam.yaml
@@ -648,4 +646,3 @@ structured_block: true
 use_memory_bos: true
 use_recent_bos: true
 ```
-

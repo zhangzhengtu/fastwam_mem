@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import shutil
 import sys
@@ -43,6 +44,13 @@ VIS_CELL_SIZE_WH = (160, 128)
 DEFAULT_EVAL_VIDEO_FPS = 10
 MIN_PRED_KEYFRAME_COMMIT_GAP_STEPS = 200
 PRED_KEYFRAME_COMMIT_THRESHOLD = 0.95
+ATTENTION_KEYFRAME_PLOT_COUNT = 4
+ATTENTION_RECENT_PLOT_COUNT = 2
+ATTENTION_EXTRA_CURVE_SERIES = [
+    ("action_to_recent_00_visual", "action -> recent 00 visual"),
+    ("action_to_recent_01_visual", "action -> recent 01 visual"),
+    ("action_to_current_visual", "action -> current visual"),
+]
 
 
 def _is_none_like(value: Any) -> bool:
@@ -234,6 +242,9 @@ class WorldActionRobotWinMemPolicy:
         action_video_freq_ratio: int,
         eval_video_enabled: bool,
         eval_video_fps: int,
+        attention_stats_enabled: bool,
+        attention_stats_save_dir: Optional[Path],
+        attention_stats_layer_mode: str,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -265,6 +276,9 @@ class WorldActionRobotWinMemPolicy:
         self.action_video_freq_ratio = int(max(1, action_video_freq_ratio))
         self.eval_video_enabled = bool(eval_video_enabled)
         self.eval_video_fps = int(max(1, eval_video_fps))
+        self.attention_stats_enabled = bool(attention_stats_enabled)
+        self.attention_stats_save_dir = attention_stats_save_dir
+        self.attention_stats_layer_mode = str(attention_stats_layer_mode)
         keyframe_memory_cfg = getattr(self.model, "keyframe_memory_config", {}) or {}
         kem_cfg = getattr(self.model, "kem_config", {}) or {}
         self.history_step_offsets = _parse_int_list(keyframe_memory_cfg.get("history_step_offsets", []))
@@ -298,6 +312,9 @@ class WorldActionRobotWinMemPolicy:
         self._pred_keyframe_snapshots: list[dict[str, Any]] = []
         self._plan_actions_executed = 0
         self._plan_saved_pred_indices: set[int] = set()
+        self._attention_rows: list[dict[str, Any]] = []
+        self._attention_plan_index = 0
+        self._attention_episode_idx: Optional[int] = None
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
@@ -553,14 +570,17 @@ class WorldActionRobotWinMemPolicy:
         return self.eval_video_enabled
 
     def start_eval_video(self, episode_idx: Optional[int] = None) -> None:
-        del episode_idx
         self._eval_video_frames.clear()
         self._active_plan_pred_frames.clear()
         self._pred_keyframe_snapshots.clear()
         self._plan_actions_executed = 0
         self._plan_saved_pred_indices.clear()
+        self._attention_rows.clear()
+        self._attention_plan_index = 0
+        self._attention_episode_idx = None if episode_idx is None else int(episode_idx)
 
     def save_eval_video(self, path: str, fps: Optional[int] = None) -> Optional[str]:
+        self._save_attention_stats(path)
         if not self.eval_video_enabled:
             return None
         self._save_pred_keyframe_snapshots(path)
@@ -592,6 +612,164 @@ class WorldActionRobotWinMemPolicy:
         logger.info("Saved %d predicted keyframe images to %s", len(self._pred_keyframe_snapshots), keyframe_dir)
         return str(keyframe_dir)
 
+    def _record_attention_stats(
+        self,
+        pred: Dict[str, Any],
+        *,
+        memory_count: int,
+        keyframe_steps: list[int],
+    ) -> None:
+        if not self.attention_stats_enabled:
+            return
+        stats = pred.get("attention_stats")
+        if not isinstance(stats, dict):
+            return
+        summary = stats.get("summary")
+        if not isinstance(summary, dict):
+            return
+        if not summary:
+            return
+
+        row: dict[str, Any] = {
+            "env_step": int(self.step_count),
+        }
+        del memory_count
+        max_keyframes = max(int(self.memory_max_keyframes), len(keyframe_steps), ATTENTION_KEYFRAME_PLOT_COUNT)
+        for keyframe_idx in range(max_keyframes):
+            step = int(keyframe_steps[keyframe_idx]) if keyframe_idx < len(keyframe_steps) else -1
+            key = f"action_to_keyframe_{keyframe_idx:02d}_visual"
+            row[f"keyframe_{keyframe_idx:02d}_step"] = step
+            row[key] = float(summary.get(key, 0.0) or 0.0)
+            row[f"{key}_contrib"] = float(summary.get(f"{key}_contrib", 0.0) or 0.0)
+        for key, _ in ATTENTION_EXTRA_CURVE_SERIES:
+            row[key] = float(summary.get(key, 0.0) or 0.0)
+            row[f"{key}_contrib"] = float(summary.get(f"{key}_contrib", 0.0) or 0.0)
+        self._attention_rows.append(row)
+        self._attention_plan_index += 1
+
+    def _attention_output_base(self, path: str) -> Path:
+        final_path = Path(path)
+        if self.attention_stats_save_dir is not None:
+            out_dir = self.attention_stats_save_dir
+        else:
+            out_dir = final_path.parent / "attention_stats"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = final_path.stem
+        if stem.endswith(".mp4"):
+            stem = stem[:-4]
+        return out_dir / f"{stem}_attention"
+
+    def _save_attention_stats(self, path: str) -> Optional[str]:
+        if not self.attention_stats_enabled or not self._attention_rows:
+            return None
+        base = self._attention_output_base(path)
+        jsonl_path = base.with_suffix(".jsonl")
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for row in self._attention_rows:
+                f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        png_path = self._plot_attention_stats(jsonl_path=jsonl_path, output_path=base.with_suffix(".png"))
+        contrib_png_path = self._plot_keyframe_contribution_stats(output_path=base.with_name(f"{base.name}_contribution.png"))
+        logger.info("Saved attention stats to %s", jsonl_path)
+        if png_path is not None:
+            logger.info("Saved attention curve to %s", png_path)
+        if contrib_png_path is not None:
+            logger.info("Saved keyframe contribution curve to %s", contrib_png_path)
+        return str(jsonl_path)
+
+    def _plot_attention_stats(self, *, jsonl_path: Path, output_path: Path) -> Optional[str]:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            logger.warning("matplotlib unavailable; skip attention plot for %s: %s", jsonl_path, exc)
+            return None
+
+        rows = list(self._attention_rows)
+        if not rows:
+            return None
+        x = [int(row["env_step"]) for row in rows]
+        plt.figure(figsize=(11, 5))
+        max_keyframes = max(int(self.memory_max_keyframes), ATTENTION_KEYFRAME_PLOT_COUNT)
+        for keyframe_idx in range(max_keyframes):
+            key = f"action_to_keyframe_{keyframe_idx:02d}_visual"
+            y = [float(row.get(key, 0.0) or 0.0) for row in rows]
+            plt.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=1.5,
+                markersize=3,
+                label=f"action -> keyframe {keyframe_idx:02d}",
+            )
+        for key, label in ATTENTION_EXTRA_CURVE_SERIES:
+            y = [float(row.get(key, 0.0) or 0.0) for row in rows]
+            plt.plot(x, y, marker="o", linewidth=1.5, markersize=3, label=label)
+        plt.xlabel("environment step")
+        plt.ylabel("attention mass")
+        plt.grid(True, alpha=0.25)
+        plt.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path, dpi=200)
+        plt.close()
+        return str(output_path)
+
+    def _plot_keyframe_contribution_stats(self, *, output_path: Path) -> Optional[str]:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            logger.warning("matplotlib unavailable; skip contribution plot for %s: %s", output_path, exc)
+            return None
+
+        rows = list(self._attention_rows)
+        if not rows:
+            return None
+        x = [int(row["env_step"]) for row in rows]
+        plt.figure(figsize=(11, 5))
+        plotted = False
+        max_keyframes = max(int(self.memory_max_keyframes), ATTENTION_KEYFRAME_PLOT_COUNT)
+        for keyframe_idx in range(max_keyframes):
+            key = f"action_to_keyframe_{keyframe_idx:02d}_visual_contrib"
+            y = [float(row.get(key, 0.0) or 0.0) for row in rows]
+            plt.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=1.5,
+                markersize=3,
+                label=f"keyframe {keyframe_idx:02d} contribution",
+            )
+            plotted = True
+        for key, label in ATTENTION_EXTRA_CURVE_SERIES:
+            contrib_key = f"{key}_contrib"
+            y = [float(row.get(contrib_key, 0.0) or 0.0) for row in rows]
+            plt.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=1.5,
+                markersize=3,
+                label=f"{label} contribution",
+            )
+            plotted = True
+        if not plotted:
+            plt.close()
+            return None
+        plt.xlabel("environment step")
+        plt.ylabel("||attention_to_group @ V_group||")
+        plt.grid(True, alpha=0.25)
+        plt.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path, dpi=200)
+        plt.close()
+        return str(output_path)
+
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
@@ -618,10 +796,16 @@ class WorldActionRobotWinMemPolicy:
         }
         infer_method = self.model.infer_joint if hasattr(self.model, "infer_joint") else self.model.infer_action
         infer_params = inspect.signature(infer_method).parameters
+        keyframe_steps = [-1 for _ in range(int(self.memory_max_keyframes))]
         if "num_video_frames" in infer_params:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         if "memory_block_video" in infer_params:
             memory_video, memory_mask, memory_steps, memory_source, memory_offsets = self._memory_block_tensors()
+            memory_count = int(memory_mask.sum().item()) if memory_mask is not None else 0
+            if memory_mask is not None and memory_steps is not None:
+                for idx in range(min(int(self.memory_max_keyframes), int(memory_mask.shape[0]))):
+                    if bool(memory_mask[idx].item()):
+                        keyframe_steps[idx] = int(memory_steps[idx].item())
             if memory_video is not None:
                 infer_kwargs["memory_block_video"] = memory_video
                 infer_kwargs["memory_block_mask"] = memory_mask
@@ -630,10 +814,21 @@ class WorldActionRobotWinMemPolicy:
                 infer_kwargs["memory_block_offsets"] = memory_offsets
         elif "memory_keyframe_video" in infer_params:
             memory_video, memory_mask, memory_steps = self._memory_tensors()
+            memory_count = int(memory_mask.sum().item()) if memory_mask is not None else 0
+            if memory_mask is not None and memory_steps is not None:
+                for idx in range(min(int(self.memory_max_keyframes), int(memory_mask.shape[0]))):
+                    if bool(memory_mask[idx].item()):
+                        keyframe_steps[idx] = int(memory_steps[idx].item())
             if memory_video is not None:
                 infer_kwargs["memory_keyframe_video"] = memory_video
                 infer_kwargs["memory_keyframe_mask"] = memory_mask
                 infer_kwargs["memory_keyframe_steps"] = memory_steps
+        else:
+            memory_count = 0
+        if self.attention_stats_enabled and "return_attention_stats" in infer_params:
+            infer_kwargs["return_attention_stats"] = True
+            infer_kwargs["attention_env_step"] = int(self.step_count)
+            infer_kwargs["attention_layer_mode"] = self.attention_stats_layer_mode
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = infer_method(**infer_kwargs)
@@ -643,6 +838,7 @@ class WorldActionRobotWinMemPolicy:
         if self.eval_video_enabled:
             self._set_active_plan_video(pred.get("video"))
         self._schedule_predicted_memory_event(pred)
+        self._record_attention_stats(pred, memory_count=memory_count, keyframe_steps=keyframe_steps)
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -770,6 +966,14 @@ def get_model(usr_args: Dict[str, Any]):
     )
     eval_video_enabled = _parse_bool(usr_args.get("eval_video_log", False))
     eval_video_fps = int(usr_args.get("eval_video_fps", DEFAULT_EVAL_VIDEO_FPS))
+    attention_stats_enabled = _parse_bool(usr_args.get("attention_stats_enabled", False))
+    attention_stats_layer_mode = str(usr_args.get("attention_stats_layer_mode", "all"))
+    attention_stats_save_dir = None
+    attention_stats_save_dir_value = usr_args.get("attention_stats_save_dir")
+    if not _is_none_like(attention_stats_save_dir_value):
+        attention_stats_save_dir = Path(str(attention_stats_save_dir_value)).expanduser().resolve()
+    elif attention_stats_enabled and not _is_none_like(usr_args.get("eval_output_dir")):
+        attention_stats_save_dir = Path(str(usr_args.get("eval_output_dir"))).expanduser().resolve() / "attention_stats"
     action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
 
     policy = WorldActionRobotWinMemPolicy(
@@ -793,6 +997,9 @@ def get_model(usr_args: Dict[str, Any]):
         action_video_freq_ratio=action_video_freq_ratio,
         eval_video_enabled=eval_video_enabled,
         eval_video_fps=eval_video_fps,
+        attention_stats_enabled=attention_stats_enabled,
+        attention_stats_save_dir=attention_stats_save_dir,
+        attention_stats_layer_mode=attention_stats_layer_mode,
     )
     return policy
 

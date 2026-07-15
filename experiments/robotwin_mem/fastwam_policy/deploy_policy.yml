@@ -26,3 +26,6 @@ timing_enabled: false
 skip_get_obs_within_replan: false
 eval_video_log: false
 eval_video_fps: 10
+attention_stats_enabled: false
+attention_stats_save_dir: null
+attention_stats_layer_mode: all

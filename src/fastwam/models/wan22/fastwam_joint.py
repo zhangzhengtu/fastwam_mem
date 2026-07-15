@@ -79,6 +79,9 @@ class FastWAMJoint(FastWAM):
         memory_block_steps: Optional[torch.Tensor] = None,
         memory_block_source: Optional[torch.Tensor] = None,
         memory_block_offsets: Optional[torch.Tensor] = None,
+        return_attention_stats: bool = False,
+        attention_env_step: Optional[int] = None,
+        attention_layer_mode: str = "all",
     ) -> dict[str, Any]:
         if test_action_with_infer_action:
             logger.warning(
@@ -110,6 +113,9 @@ class FastWAMJoint(FastWAM):
             memory_block_steps=memory_block_steps,
             memory_block_source=memory_block_source,
             memory_block_offsets=memory_block_offsets,
+            return_attention_stats=return_attention_stats,
+            attention_env_step=attention_env_step,
+            attention_layer_mode=attention_layer_mode,
         )
 
     @torch.no_grad()

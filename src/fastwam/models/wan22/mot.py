@@ -5,6 +5,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
+from .attention_probe import AttentionProbe, collect_attention_stats
 from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
 
@@ -349,6 +350,8 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        attention_probe: Optional[AttentionProbe] = None,
+        probe_denoise_step: int = 0,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -425,6 +428,21 @@ class MoT(nn.Module):
             # Mixed attention: action queries attend to cached video K/V plus current action K/V.
             k_cat = torch.cat([k_video, k_action], dim=1)
             v_cat = torch.cat([v_video, v_action], dim=1)
+            if attention_probe is not None and attention_probe.enabled:
+                values = collect_attention_stats(
+                    q=q_action,
+                    k=k_cat,
+                    mask=action_attention_mask,
+                    v=v_cat,
+                    num_heads=self.num_heads,
+                    query_spans=attention_probe.query_spans,
+                    key_spans=attention_probe.key_spans,
+                )
+                attention_probe.add(
+                    denoise_step=probe_denoise_step,
+                    layer_idx=layer_idx,
+                    values=values,
+                )
             mixed = self._mixed_attention(
                 q_cat=q_action,
                 k_cat=k_cat,
@@ -451,6 +469,8 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        attention_probe: Optional[AttentionProbe] = None,
+        probe_denoise_step: int = 0,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -538,6 +558,21 @@ class MoT(nn.Module):
                     f"mask={mask_seq} vs tokens={total_seq}"
                 )
 
+            if attention_probe is not None and attention_probe.enabled:
+                values = collect_attention_stats(
+                    q=q_cat,
+                    k=k_cat,
+                    mask=attention_mask,
+                    v=v_cat,
+                    num_heads=self.num_heads,
+                    query_spans=attention_probe.query_spans,
+                    key_spans=attention_probe.key_spans,
+                )
+                attention_probe.add(
+                    denoise_step=probe_denoise_step,
+                    layer_idx=layer_idx,
+                    values=values,
+                )
             mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
 
             start = 0

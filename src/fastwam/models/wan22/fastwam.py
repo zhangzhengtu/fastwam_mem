@@ -8,6 +8,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .attention_probe import AttentionProbe
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -178,6 +179,62 @@ class FastWAM(torch.nn.Module):
         nn.init.normal_(self.recent_bos_token, std=0.02)
 
         self.to(self.device)
+
+    @staticmethod
+    def _empty_memory_attention_spans() -> dict[str, tuple[int, int]]:
+        return {
+            "mem_bos": (0, 0),
+            "keyframe_visual": (0, 0),
+            "recent_bos": (0, 0),
+            "recent_visual": (0, 0),
+            "memory_all": (0, 0),
+        }
+
+    @staticmethod
+    def _action_attention_probe_spans(
+        memory_info: dict[str, Any],
+        action_seq_len: int,
+        current_visual_span: tuple[int, int] = (0, 0),
+    ) -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int]]]:
+        memory_spans = dict(memory_info.get("spans") or FastWAM._empty_memory_attention_spans())
+        key_names = {"mem_bos", "keyframe_visual", "recent_bos", "recent_visual", "memory_all"}
+        key_spans = {
+            name: tuple(span)
+            for name, span in memory_spans.items()
+            if name in key_names
+            or (name.startswith("keyframe_") and name.endswith("_visual"))
+            or (name.startswith("recent_") and name.endswith("_visual"))
+        }
+        key_spans["current_visual"] = tuple(current_visual_span)
+        return {"action": (0, int(action_seq_len))}, key_spans
+
+    @staticmethod
+    def _joint_attention_probe_spans(
+        memory_info: dict[str, Any],
+        *,
+        video_seq_len: int,
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+    ) -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int]]]:
+        memory_seq_len = int(memory_info.get("memory_seq_len", 0))
+        video_seq_len = int(video_seq_len)
+        action_seq_len = int(action_seq_len)
+        first_frame_end = min(memory_seq_len + int(video_tokens_per_frame), video_seq_len)
+        memory_spans = dict(memory_info.get("spans") or FastWAM._empty_memory_attention_spans())
+        key_names = {"mem_bos", "keyframe_visual", "recent_bos", "recent_visual", "memory_all"}
+        key_spans = {
+            name: tuple(span)
+            for name, span in memory_spans.items()
+            if name in key_names
+            or (name.startswith("keyframe_") and name.endswith("_visual"))
+            or (name.startswith("recent_") and name.endswith("_visual"))
+        }
+        key_spans["current_visual"] = (memory_seq_len, first_frame_end)
+        query_spans = {
+            "noisy_video": (first_frame_end, video_seq_len),
+            "action": (video_seq_len, video_seq_len + action_seq_len),
+        }
+        return query_spans, key_spans
 
     @classmethod
     def from_wan22_pretrained(
@@ -677,7 +734,12 @@ class FastWAM(torch.nn.Module):
         ):
             return {
                 "memory_seq_len": 0,
+                "keyframe_seq_len": 0,
+                "recent_seq_len": 0,
+                "memory_bos_seq_len": 0,
+                "recent_bos_seq_len": 0,
                 "memory_token_mask": None,
+                "spans": self._empty_memory_attention_spans(),
             }
 
         if self.keyframe_memory_structured_block:
@@ -699,7 +761,12 @@ class FastWAM(torch.nn.Module):
         if not bool(memory_keyframe_mask.any().item()):
             return {
                 "memory_seq_len": 0,
+                "keyframe_seq_len": 0,
+                "recent_seq_len": 0,
+                "memory_bos_seq_len": 0,
+                "recent_bos_seq_len": 0,
                 "memory_token_mask": None,
+                "spans": self._empty_memory_attention_spans(),
             }
         batch_size, num_keyframes, channels, height, width = memory_keyframe_video.shape
         if channels != 3:
@@ -750,9 +817,24 @@ class FastWAM(torch.nn.Module):
         video_pre["t_mod"] = torch.cat([memory_t_mod, video_pre["t_mod"]], dim=1)
         video_pre["context_mask"] = torch.cat([memory_context_mask, video_pre["context_mask"]], dim=1)
         memory_token_mask = memory_keyframe_mask.repeat_interleave(tokens_per_frame, dim=1)
+        spans = {
+            "mem_bos": (0, 0),
+            "keyframe_visual": (0, memory_seq_len),
+            "recent_bos": (0, 0),
+            "recent_visual": (0, 0),
+            "memory_all": (0, memory_seq_len),
+        }
+        for keyframe_idx in range(num_keyframes):
+            start = keyframe_idx * tokens_per_frame
+            spans[f"keyframe_{keyframe_idx:02d}_visual"] = (start, start + tokens_per_frame)
         return {
             "memory_seq_len": memory_seq_len,
+            "keyframe_seq_len": memory_seq_len,
+            "recent_seq_len": 0,
+            "memory_bos_seq_len": 0,
+            "recent_bos_seq_len": 0,
             "memory_token_mask": memory_token_mask,
+            "spans": spans,
         }
 
     def _memory_freqs_for_offsets(
@@ -818,6 +900,7 @@ class FastWAM(torch.nn.Module):
                 "memory_bos_seq_len": 0,
                 "recent_bos_seq_len": 0,
                 "memory_token_mask": None,
+                "spans": self._empty_memory_attention_spans(),
             }
 
         batch_size, num_slots, channels, height, width = memory_block_video.shape
@@ -953,20 +1036,38 @@ class FastWAM(torch.nn.Module):
             return slot_count * tokens_per_frame
 
         keyframe_active = keyframe_slot_mask[:, keyframe_slot_layout].any(dim=1, keepdim=True) if bool(keyframe_slot_layout.any().item()) else torch.zeros((batch_size, 1), dtype=torch.bool, device=memory_block_mask.device)
+        keyframe_frame_spans: dict[str, tuple[int, int]] = {}
         if bool(keyframe_slot_layout.any().item()):
             if self.use_memory_bos:
                 active = keyframe_active | bool(self.memory_bos_insert_when_empty)
                 memory_bos_seq_len, added = add_bos(self.memory_bos_token, active)
                 keyframe_seq_len += added
-            keyframe_seq_len += add_visual_slots(keyframe_slot_layout, keyframe_slot_mask)
+            keyframe_visual_start = int(keyframe_seq_len)
+            keyframe_visual_len = add_visual_slots(keyframe_slot_layout, keyframe_slot_mask)
+            keyframe_seq_len += keyframe_visual_len
+            for keyframe_idx in range(keyframe_visual_len // tokens_per_frame):
+                start = keyframe_visual_start + keyframe_idx * tokens_per_frame
+                keyframe_frame_spans[f"keyframe_{keyframe_idx:02d}_visual"] = (
+                    start,
+                    start + tokens_per_frame,
+                )
 
         recent_active = recent_slot_mask[:, recent_slot_layout].any(dim=1, keepdim=True) if bool(recent_slot_layout.any().item()) else torch.zeros((batch_size, 1), dtype=torch.bool, device=memory_block_mask.device)
+        recent_frame_spans: dict[str, tuple[int, int]] = {}
         if bool(recent_slot_layout.any().item()):
             if self.use_recent_bos:
                 active = recent_active | bool(self.recent_bos_insert_when_empty)
                 recent_bos_seq_len, added = add_bos(self.recent_bos_token, active)
                 recent_seq_len += added
-            recent_seq_len += add_visual_slots(recent_slot_layout, recent_slot_mask)
+            recent_visual_start = int(keyframe_seq_len + recent_seq_len)
+            recent_visual_len = add_visual_slots(recent_slot_layout, recent_slot_mask)
+            recent_seq_len += recent_visual_len
+            for recent_idx in range(recent_visual_len // tokens_per_frame):
+                start = recent_visual_start + recent_idx * tokens_per_frame
+                recent_frame_spans[f"recent_{recent_idx:02d}_visual"] = (
+                    start,
+                    start + tokens_per_frame,
+                )
 
         if not token_pieces:
             return {
@@ -976,6 +1077,7 @@ class FastWAM(torch.nn.Module):
                 "memory_bos_seq_len": 0,
                 "recent_bos_seq_len": 0,
                 "memory_token_mask": None,
+                "spans": self._empty_memory_attention_spans(),
             }
 
         memory_tokens = torch.cat(token_pieces, dim=1)
@@ -993,13 +1095,26 @@ class FastWAM(torch.nn.Module):
         video_pre["t_mod"] = torch.cat([memory_t_mod, video_pre["t_mod"]], dim=1)
         video_pre["context_mask"] = torch.cat([memory_context_mask, video_pre["context_mask"]], dim=1)
 
+        memory_seq_len = int(memory_tokens.shape[1])
+        recent_bos_start = int(keyframe_seq_len)
+        recent_bos_end = recent_bos_start + int(recent_bos_seq_len)
+        spans = {
+            "mem_bos": (0, int(memory_bos_seq_len)),
+            "keyframe_visual": (int(memory_bos_seq_len), int(keyframe_seq_len)),
+            "recent_bos": (recent_bos_start, recent_bos_end),
+            "recent_visual": (recent_bos_end, memory_seq_len),
+            "memory_all": (0, memory_seq_len),
+        }
+        spans.update(keyframe_frame_spans)
+        spans.update(recent_frame_spans)
         return {
-            "memory_seq_len": int(memory_tokens.shape[1]),
+            "memory_seq_len": memory_seq_len,
             "keyframe_seq_len": int(keyframe_seq_len),
             "recent_seq_len": int(recent_seq_len),
             "memory_bos_seq_len": int(memory_bos_seq_len),
             "recent_bos_seq_len": int(recent_bos_seq_len),
             "memory_token_mask": memory_token_mask,
+            "spans": spans,
         }
 
     def _select_chunk_event(self, kem_probs: torch.Tensor, threshold: Optional[float] = None) -> dict[str, torch.Tensor]:
@@ -1399,6 +1514,8 @@ class FastWAM(torch.nn.Module):
         memory_block_source: Optional[torch.Tensor] = None,
         memory_block_offsets: Optional[torch.Tensor] = None,
         tiled: bool = False,
+        attention_probe: Optional[AttentionProbe] = None,
+        probe_denoise_step: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
@@ -1431,6 +1548,19 @@ class FastWAM(torch.nn.Module):
             memory_seq_len=int(memory_info["memory_seq_len"]),
             memory_token_mask=memory_info["memory_token_mask"],
         )
+        if attention_probe is not None:
+            probe_query_spans, probe_key_spans = self._joint_attention_probe_spans(
+                memory_info=memory_info,
+                video_seq_len=int(video_pre["tokens"].shape[1]),
+                action_seq_len=int(action_pre["tokens"].shape[1]),
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            )
+            attention_probe.query_spans = {
+                name: span for name, span in probe_query_spans.items() if int(span[1]) > int(span[0])
+            }
+            attention_probe.key_spans = {
+                name: span for name, span in probe_key_spans.items() if int(span[1]) > int(span[0])
+            }
 
         tokens_out = self.mot(
             embeds_all={
@@ -1456,6 +1586,8 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            attention_probe=attention_probe,
+            probe_denoise_step=probe_denoise_step,
         )
 
         pred_video_tokens = tokens_out["video"]
@@ -1536,6 +1668,8 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
         return_tokens: bool = False,
+        attention_probe: Optional[AttentionProbe] = None,
+        probe_denoise_step: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -1554,6 +1688,8 @@ class FastWAM(torch.nn.Module):
             video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
             video_seq_len=video_seq_len,
+            attention_probe=attention_probe,
+            probe_denoise_step=probe_denoise_step,
         )
         pred_action = self.action_expert.post_dit(action_tokens, action_pre)
         if return_tokens:
@@ -1675,6 +1811,9 @@ class FastWAM(torch.nn.Module):
         memory_block_steps: Optional[torch.Tensor] = None,
         memory_block_source: Optional[torch.Tensor] = None,
         memory_block_offsets: Optional[torch.Tensor] = None,
+        return_attention_stats: bool = False,
+        attention_env_step: Optional[int] = None,
+        attention_layer_mode: str = "all",
     ) -> dict[str, Any]:
         self.eval()
         memory_keyframe_video, memory_keyframe_mask, memory_block_source, memory_block_offsets = self._prepare_inference_memory_block(
@@ -1812,12 +1951,19 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
+        attention_probe = None
+        if return_attention_stats:
+            attention_probe = AttentionProbe(
+                env_step=attention_env_step,
+                layer_mode=attention_layer_mode,
+                num_layers=int(self.mot.num_layers),
+            )
+        for denoise_step, (step_t_video, step_delta_video, step_t_action, step_delta_action) in enumerate(zip(
             infer_timesteps_video,
             infer_deltas_video,
             infer_timesteps_action,
             infer_deltas_action,
-        ):
+        )):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
@@ -1835,6 +1981,8 @@ class FastWAM(torch.nn.Module):
                 memory_block_source=memory_block_source,
                 memory_block_offsets=memory_block_offsets,
                 tiled=tiled,
+                attention_probe=attention_probe,
+                probe_denoise_step=denoise_step,
             )
             pred_video = pred_video_posi
             pred_action = pred_action_posi
@@ -1855,6 +2003,15 @@ class FastWAM(torch.nn.Module):
             "video": self._decode_latents(latents_video, tiled=tiled),
             "action": action_out,
         }
+        if attention_probe is not None:
+            attention_stats = attention_probe.to_dict()
+            attention_stats.update(
+                {
+                    "mode": "joint",
+                    "num_denoise_steps": int(num_inference_steps),
+                }
+            )
+            result["attention_stats"] = attention_stats
         if action_only_pred is not None:
             for key in (
                 "chunk_keyframe_prob",
@@ -1890,6 +2047,9 @@ class FastWAM(torch.nn.Module):
         memory_block_steps: Optional[torch.Tensor] = None,
         memory_block_source: Optional[torch.Tensor] = None,
         memory_block_offsets: Optional[torch.Tensor] = None,
+        return_attention_stats: bool = False,
+        attention_env_step: Optional[int] = None,
+        attention_layer_mode: str = "all",
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -2001,6 +2161,26 @@ class FastWAM(torch.nn.Module):
             memory_token_mask=memory_info["memory_token_mask"],
         )
         attention_mask_for_cache = attention_mask[0, 0] if attention_mask.ndim == 4 else attention_mask
+        attention_probe = None
+        if return_attention_stats:
+            probe_query_spans, probe_key_spans = self._action_attention_probe_spans(
+                memory_info=memory_info,
+                action_seq_len=int(latents_action.shape[1]),
+                current_visual_span=(
+                    int(memory_info["memory_seq_len"]),
+                    int(memory_info["memory_seq_len"]) + int(video_pre["meta"]["tokens_per_frame"]),
+                ),
+            )
+            probe_key_spans = {
+                name: span for name, span in probe_key_spans.items() if int(span[1]) > int(span[0])
+            }
+            attention_probe = AttentionProbe(
+                env_step=attention_env_step,
+                layer_mode=attention_layer_mode,
+                num_layers=int(self.mot.num_layers),
+                query_spans=probe_query_spans,
+                key_spans=probe_key_spans,
+            )
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
             video_freqs=video_pre["freqs"],
@@ -2019,7 +2199,7 @@ class FastWAM(torch.nn.Module):
             shift_override=sigma_shift,
         )
         last_action_tokens = None
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+        for denoise_step, (step_t_action, step_delta_action) in enumerate(zip(infer_timesteps_action, infer_deltas_action)):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
             pred_action_result = self._predict_action_noise_with_cache(
@@ -2031,6 +2211,8 @@ class FastWAM(torch.nn.Module):
                 attention_mask=attention_mask_for_cache,
                 video_seq_len=video_seq_len,
                 return_tokens=self.kem_enabled,
+                attention_probe=attention_probe,
+                probe_denoise_step=denoise_step,
             )
             if self.kem_enabled:
                 pred_action_posi, last_action_tokens = pred_action_result
@@ -2043,6 +2225,17 @@ class FastWAM(torch.nn.Module):
         result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if attention_probe is not None:
+            attention_stats = attention_probe.to_dict()
+            attention_stats.update(
+                {
+                    "memory_seq_len": int(memory_info["memory_seq_len"]),
+                    "keyframe_seq_len": int(memory_info.get("keyframe_seq_len", 0)),
+                    "recent_seq_len": int(memory_info.get("recent_seq_len", 0)),
+                    "num_denoise_steps": int(num_inference_steps),
+                }
+            )
+            result["attention_stats"] = attention_stats
         if self.kem_enabled and self.kem_head is not None and last_action_tokens is not None:
             kem_logits = self.kem_head(last_action_tokens).squeeze(-1)
             kem_probs = torch.sigmoid(kem_logits.float())

@@ -253,6 +253,15 @@ def main(cfg: DictConfig):
     )
     _append_override(overrides, "eval_video_log", cfg.EVALUATION.eval_video_log)
     _append_override(overrides, "eval_video_fps", cfg.EVALUATION.eval_video_fps)
+    _append_override(overrides, "attention_stats_enabled", cfg.EVALUATION.attention_stats_enabled)
+    _append_override(overrides, "attention_stats_layer_mode", cfg.EVALUATION.attention_stats_layer_mode)
+    attention_stats_save_dir = _resolve_optional_path(
+        cfg.EVALUATION.attention_stats_save_dir,
+        base=PROJECT_ROOT,
+    )
+    if attention_stats_save_dir is None and bool(cfg.EVALUATION.attention_stats_enabled):
+        attention_stats_save_dir = robotwin_eval_base / "attention_stats"
+    _append_override(overrides, "attention_stats_save_dir", None if attention_stats_save_dir is None else str(attention_stats_save_dir))
 
     cmd = [
         sys.executable,
