@@ -6,11 +6,11 @@ defaults:
   - _self_
 
 # dataloading
-batch_size: 8
+batch_size: 4
 num_workers: 8
 sampler:
   type: sequential_episode
-  sampling_interval: 1
+  sampling_interval: 32
   shuffle_trajectories: true
   balance_dataset_step_counts: false
   uniform_dataset_sampling: true
