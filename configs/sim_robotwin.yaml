@@ -45,6 +45,7 @@ EVALUATION:
 
 MULTIRUN:
   enabled: false
+  task_names: null
   num_gpus: 8
   max_tasks_per_gpu: 2
 

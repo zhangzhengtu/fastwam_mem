@@ -14,7 +14,7 @@ from typing import Any
 import hydra
 import yaml
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SINGLE_ENTRY = PROJECT_ROOT / "experiments" / "robotwin_mem" / "eval_robotwin_mem_single.py"
@@ -100,6 +100,20 @@ def _load_all_tasks() -> list[str]:
         seen.add(task)
         dedup_tasks.append(task)
     return dedup_tasks
+
+
+def _parse_task_names(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "" or text.lower() in {"none", "null"}:
+            return []
+        return [item.strip() for item in text.split(",") if item.strip() != ""]
+    if isinstance(value, (list, tuple, ListConfig)):
+        tasks = [str(item).strip() for item in value if str(item).strip() != ""]
+        return tasks
+    raise TypeError(f"Unsupported MULTIRUN.task_names type: {type(value).__name__}")
 
 
 def _parse_result_file(result_file: Path) -> dict[str, float | None]:
@@ -208,11 +222,23 @@ def main(cfg: DictConfig):
     summary_csv = run_output_dir / "summary.csv"
     summary_json = run_output_dir / "summary.json"
 
+    task_names_cfg = _parse_task_names(cfg.MULTIRUN.get("task_names", None))
     task_name_cfg = cfg.EVALUATION.task_name
-    if task_name_cfg is None or str(task_name_cfg).strip() == "":
+    if len(task_names_cfg) > 0:
+        tasks = task_names_cfg
+    elif task_name_cfg is None or str(task_name_cfg).strip() == "":
         tasks = _load_all_tasks()
     else:
         tasks = [str(task_name_cfg)]
+
+    seen_tasks: set[str] = set()
+    duplicate_tasks: list[str] = []
+    for task_name in tasks:
+        if task_name in seen_tasks:
+            duplicate_tasks.append(task_name)
+        seen_tasks.add(task_name)
+    if len(duplicate_tasks) > 0:
+        raise ValueError(f"Duplicate task names in MULTIRUN.task_names: {duplicate_tasks}")
 
     extra_overrides = _collect_worker_overrides()
 

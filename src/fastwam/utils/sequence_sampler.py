@@ -30,6 +30,7 @@ class SequentialEpisodeSampler(Sampler[EpisodeSampleIndex]):
         sampling_interval: int = 1,
         shuffle_trajectories: bool = True,
         balance_dataset_step_counts: bool = False,
+        uniform_dataset_sampling: bool = False,
     ):
         self.dataset = dataset
         self.seed = int(seed)
@@ -40,6 +41,7 @@ class SequentialEpisodeSampler(Sampler[EpisodeSampleIndex]):
         self.sampling_interval = max(int(sampling_interval), 1)
         self.shuffle_trajectories = bool(shuffle_trajectories)
         self.balance_dataset_step_counts = bool(balance_dataset_step_counts)
+        self.uniform_dataset_sampling = bool(uniform_dataset_sampling)
         self.epoch = 0
         self.epoch_offset = 0
         self.resume_batch_offset = 0
@@ -166,6 +168,85 @@ class SequentialEpisodeSampler(Sampler[EpisodeSampleIndex]):
             stream = stream + (stream * repeats)[: target_len - len(stream)]
         return stream[:target_len]
 
+    def _resize_stream_for_dataset(
+        self,
+        stream: list[EpisodeSampleIndex],
+        *,
+        target_len: int,
+        rank: int,
+        dataset_index: int,
+    ) -> list[EpisodeSampleIndex]:
+        if target_len <= 0:
+            return []
+        if not stream:
+            raise ValueError(f"No samples available for dataset_index={dataset_index}.")
+        if len(stream) == target_len:
+            return list(stream)
+
+        offset = (
+            self._stable_hash_int(
+                self.seed,
+                self.epoch,
+                self.epoch_offset,
+                rank,
+                dataset_index,
+                "uniform_dataset_sampling",
+            )
+            % len(stream)
+        )
+        return [stream[(offset + i) % len(stream)] for i in range(target_len)]
+
+    def _balance_rank_streams_by_dataset(
+        self,
+        rank_streams: list[list[EpisodeSampleIndex]],
+    ) -> list[list[EpisodeSampleIndex]]:
+        dataset_indices = sorted({
+            int(sample[0])
+            for rank_stream in rank_streams
+            for sample in rank_stream
+        })
+        if len(dataset_indices) <= 1:
+            return rank_streams
+
+        grouped: list[dict[int, list[EpisodeSampleIndex]]] = []
+        global_by_dataset: dict[int, list[EpisodeSampleIndex]] = {
+            dataset_index: [] for dataset_index in dataset_indices
+        }
+        for rank_stream in rank_streams:
+            rank_groups = {dataset_index: [] for dataset_index in dataset_indices}
+            for sample in rank_stream:
+                dataset_index = int(sample[0])
+                rank_groups[dataset_index].append(sample)
+                global_by_dataset[dataset_index].append(sample)
+            grouped.append(rank_groups)
+
+        target_len = max(
+            (len(rank_groups[dataset_index]) for rank_groups in grouped for dataset_index in dataset_indices),
+            default=0,
+        )
+        if target_len <= 0:
+            return rank_streams
+
+        balanced_streams: list[list[EpisodeSampleIndex]] = []
+        for rank, rank_groups in enumerate(grouped):
+            resized_by_dataset: dict[int, list[EpisodeSampleIndex]] = {}
+            for dataset_index in dataset_indices:
+                base_stream = rank_groups[dataset_index] or global_by_dataset[dataset_index]
+                resized_by_dataset[dataset_index] = self._resize_stream_for_dataset(
+                    base_stream,
+                    target_len=target_len,
+                    rank=rank,
+                    dataset_index=dataset_index,
+                )
+
+            rank_stream: list[EpisodeSampleIndex] = []
+            for sample_idx in range(target_len):
+                for dataset_index in dataset_indices:
+                    rank_stream.append(resized_by_dataset[dataset_index][sample_idx])
+            balanced_streams.append(rank_stream)
+
+        return balanced_streams
+
     def _build_epoch_indices(self) -> list[EpisodeSampleIndex]:
         if self._cached_epoch == self.epoch and self._cached_indices:
             return list(self._cached_indices)
@@ -176,6 +257,8 @@ class SequentialEpisodeSampler(Sampler[EpisodeSampleIndex]):
             self._build_stream_for_trajectories(episode_dataset, trajectories)
             for trajectories in rank_trajectories
         ]
+        if self.uniform_dataset_sampling:
+            rank_streams = self._balance_rank_streams_by_dataset(rank_streams)
 
         fallback = (0, 0, 0, True, True, 0, -1, False)
         for rank_stream in rank_streams:

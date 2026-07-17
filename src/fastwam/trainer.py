@@ -191,6 +191,7 @@ class Wan22Trainer:
                 sampling_interval=int(sampler_cfg.get("sampling_interval", 1)),
                 shuffle_trajectories=bool(sampler_cfg.get("shuffle_trajectories", True)),
                 balance_dataset_step_counts=bool(sampler_cfg.get("balance_dataset_step_counts", False)),
+                uniform_dataset_sampling=bool(sampler_cfg.get("uniform_dataset_sampling", False)),
             )
         elif sampler_type == "random":
             self.train_sampler = ResumableEpochSampler(

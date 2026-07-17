@@ -17,6 +17,7 @@ sampler:
   sampling_interval: 1
   shuffle_trajectories: true
   balance_dataset_step_counts: false
+  uniform_dataset_sampling: false
 
 # scheduler
 lr_scheduler_type: "cosine"
