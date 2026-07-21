@@ -1,0 +1,29 @@
+defaults:
+  - robotwin
+  - _self_
+
+# Mixed RoboTwin extra-data config.
+# Each path below is expected to be a complete LeRobot dataset directory.
+task_name: extra_4tasks
+
+train:
+  dataset_dirs:
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/rearrange_blocks_hard
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/observe_and_pickup_hard
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/reproduct_route
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/press_button_keyframe
+  val_set_proportion: 0.01
+  is_training_set: true
+  pretrained_norm_stats: null
+  text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_extra/${data.task_name}
+
+val:
+  dataset_dirs:
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/rearrange_blocks_hard
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/observe_and_pickup_hard
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/reproduct_route
+    - /mnt/inspurfs/efm_t/yangganlin/workspace_tzz/data/extra_data/press_button_keyframe
+  val_set_proportion: 0.01
+  is_training_set: false
+  pretrained_norm_stats: null
+  text_embedding_cache_dir: ./data/text_embeds_cache/robotwin_extra/${data.task_name}

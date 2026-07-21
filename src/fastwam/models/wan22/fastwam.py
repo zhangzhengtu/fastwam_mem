@@ -1514,9 +1514,10 @@ class FastWAM(torch.nn.Module):
         memory_block_source: Optional[torch.Tensor] = None,
         memory_block_offsets: Optional[torch.Tensor] = None,
         tiled: bool = False,
+        return_tokens: bool = False,
         attention_probe: Optional[AttentionProbe] = None,
         probe_denoise_step: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
             timestep=timestep_video,
@@ -1595,6 +1596,8 @@ class FastWAM(torch.nn.Module):
             pred_video_tokens = pred_video_tokens[:, int(memory_info["memory_seq_len"]):]
         pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        if return_tokens:
+            return pred_video, pred_action, tokens_out["action"]
         return pred_video, pred_action
 
     @torch.no_grad()
@@ -1958,6 +1961,7 @@ class FastWAM(torch.nn.Module):
                 layer_mode=attention_layer_mode,
                 num_layers=int(self.mot.num_layers),
             )
+        last_joint_action_tokens = None
         for denoise_step, (step_t_video, step_delta_video, step_t_action, step_delta_action) in enumerate(zip(
             infer_timesteps_video,
             infer_deltas_video,
@@ -1967,7 +1971,7 @@ class FastWAM(torch.nn.Module):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_video_posi, pred_action_posi = self._predict_joint_noise(
+            pred_joint_result = self._predict_joint_noise(
                 latents_video=latents_video,
                 latents_action=latents_action,
                 timestep_video=timestep_video,
@@ -1981,9 +1985,14 @@ class FastWAM(torch.nn.Module):
                 memory_block_source=memory_block_source,
                 memory_block_offsets=memory_block_offsets,
                 tiled=tiled,
+                return_tokens=self.kem_enabled,
                 attention_probe=attention_probe,
                 probe_denoise_step=denoise_step,
             )
+            if self.kem_enabled:
+                pred_video_posi, pred_action_posi, last_joint_action_tokens = pred_joint_result
+            else:
+                pred_video_posi, pred_action_posi = pred_joint_result
             pred_video = pred_video_posi
             pred_action = pred_action_posi
 
@@ -2021,6 +2030,18 @@ class FastWAM(torch.nn.Module):
             ):
                 if key in action_only_pred:
                     result[key] = action_only_pred[key]
+        elif self.kem_enabled and self.kem_head is not None and last_joint_action_tokens is not None:
+            kem_logits = self.kem_head(last_joint_action_tokens).squeeze(-1)
+            kem_probs = torch.sigmoid(kem_logits.float())
+            event = self._select_chunk_event(kem_probs)
+            result.update(
+                {
+                    "chunk_keyframe_prob": kem_probs[0].detach().to(device="cpu", dtype=torch.float32),
+                    "pred_event_offset": int(event["pred_event_offset"][0].detach().cpu().item()),
+                    "pred_event_confidence": float(event["pred_event_confidence"][0].detach().cpu().item()),
+                    "should_trigger_event": bool(event["should_trigger_event"][0].detach().cpu().item()),
+                }
+            )
         return result
 
     @torch.no_grad()

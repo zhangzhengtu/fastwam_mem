@@ -249,6 +249,7 @@ class FastWAMJoint(FastWAM):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+        last_action_tokens = None
         for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
             infer_timesteps_video,
             infer_deltas_video,
@@ -258,7 +259,7 @@ class FastWAMJoint(FastWAM):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_video_posi, pred_action_posi = self._predict_joint_noise(
+            pred_joint_result = self._predict_joint_noise(
                 latents_video=latents_video,
                 latents_action=latents_action,
                 timestep_video=timestep_video,
@@ -272,12 +273,30 @@ class FastWAMJoint(FastWAM):
                 memory_block_source=memory_block_source,
                 memory_block_offsets=memory_block_offsets,
                 tiled=tiled,
+                return_tokens=self.kem_enabled,
             )
+            if self.kem_enabled:
+                pred_video_posi, pred_action_posi, last_action_tokens = pred_joint_result
+            else:
+                pred_video_posi, pred_action_posi = pred_joint_result
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
-        return {
+        result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if self.kem_enabled and self.kem_head is not None and last_action_tokens is not None:
+            kem_logits = self.kem_head(last_action_tokens).squeeze(-1)
+            kem_probs = torch.sigmoid(kem_logits.float())
+            event = self._select_chunk_event(kem_probs)
+            result.update(
+                {
+                    "chunk_keyframe_prob": kem_probs[0].detach().to(device="cpu", dtype=torch.float32),
+                    "pred_event_offset": int(event["pred_event_offset"][0].detach().cpu().item()),
+                    "pred_event_confidence": float(event["pred_event_confidence"][0].detach().cpu().item()),
+                    "should_trigger_event": bool(event["should_trigger_event"][0].detach().cpu().item()),
+                }
+            )
+        return result

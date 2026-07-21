@@ -42,8 +42,8 @@ ROBOTWIN_HEAD_SIZE_WH = (320, 256)
 ROBOTWIN_WRIST_SIZE_WH = (160, 128)
 VIS_CELL_SIZE_WH = (160, 128)
 DEFAULT_EVAL_VIDEO_FPS = 10
-MIN_PRED_KEYFRAME_COMMIT_GAP_STEPS = 200
-PRED_KEYFRAME_COMMIT_THRESHOLD = 0.95
+MIN_PRED_KEYFRAME_COMMIT_GAP_STEPS = 100
+PRED_KEYFRAME_COMMIT_THRESHOLD = 0.85
 ATTENTION_KEYFRAME_PLOT_COUNT = 4
 ATTENTION_RECENT_PLOT_COUNT = 2
 ATTENTION_EXTRA_CURVE_SERIES = [
@@ -51,6 +51,12 @@ ATTENTION_EXTRA_CURVE_SERIES = [
     ("action_to_recent_01_visual", "action -> recent 01 visual"),
     ("action_to_current_visual", "action -> current visual"),
 ]
+
+
+def _diag(message: str, *args: Any) -> None:
+    text = message % args if args else message
+    print(f"[FastWAMPolicyDiag] {text}", flush=True)
+    logger.info(message, *args)
 
 
 def _is_none_like(value: Any) -> bool:
@@ -411,8 +417,18 @@ class WorldActionRobotWinMemPolicy:
         confidence: Optional[float] = None,
     ) -> None:
         if not self.memory_enabled:
+            _diag("Skip FastWAM keyframe commit at step=%d: memory disabled.", step)
             return
         if step - self._last_committed_memory_step < self._memory_cooldown_steps:
+            _diag(
+                "Skip FastWAM keyframe commit at step=%d: cooldown gap=%d < %d "
+                "(last_committed=%d, confidence=%.4f).",
+                step,
+                step - self._last_committed_memory_step,
+                self._memory_cooldown_steps,
+                self._last_committed_memory_step,
+                float(confidence or 0.0),
+            )
             return
         image_tensor = self._build_robotwin_image_tensor(observation)[0].detach().to(device="cpu", dtype=torch.float32)
         self.memory_bank.append((int(step), image_tensor))
@@ -425,10 +441,23 @@ class WorldActionRobotWinMemPolicy:
             }
         )
         self._last_committed_memory_step = int(step)
-        logger.debug("Committed FastWAM keyframe memory at step=%d count=%d", step, len(self.memory_bank))
+        _diag(
+            "Committed FastWAM keyframe memory at step=%d confidence=%.4f count=%d.",
+            step,
+            float(confidence or 0.0),
+            len(self.memory_bank),
+        )
 
     def _maybe_commit_pending_memory(self, observation: Optional[Dict[str, Any]]) -> None:
         if observation is None or self._pending_memory_commit_step is None:
+            if observation is None and self._pending_memory_commit_step is not None:
+                _diag(
+                    "Pending FastWAM keyframe commit at step=%d cannot commit now: observation is None "
+                    "(current_step=%d, confidence=%.4f).",
+                    self._pending_memory_commit_step,
+                    self.step_count,
+                    self._pending_memory_confidence,
+                )
             return
         if self.step_count < self._pending_memory_commit_step:
             return
@@ -441,27 +470,88 @@ class WorldActionRobotWinMemPolicy:
         self._pending_memory_confidence = 0.0
 
     def _schedule_predicted_memory_event(self, pred: Dict[str, Any]) -> None:
-        if not self.memory_enabled or not bool(pred.get("should_trigger_event", False)):
-            return
+        should_trigger = bool(pred.get("should_trigger_event", False))
         pred_offset = int(pred.get("pred_event_offset", -1))
+        confidence = float(pred.get("pred_event_confidence", 0.0))
+        if not self.memory_enabled:
+            _diag(
+                "Skip FastWAM keyframe schedule at step=%d: memory disabled "
+                "(should=%s, offset=%d, confidence=%.4f).",
+                self.step_count,
+                should_trigger,
+                pred_offset,
+                confidence,
+            )
+            return
+        if not should_trigger:
+            _diag(
+                "Skip FastWAM keyframe schedule at step=%d: should_trigger_event=false "
+                "(offset=%d, confidence=%.4f, threshold=%.4f).",
+                self.step_count,
+                pred_offset,
+                confidence,
+                self.event_commit_threshold,
+            )
+            return
         if pred_offset < 0:
+            _diag(
+                "Skip FastWAM keyframe schedule at step=%d: invalid pred_event_offset=%d "
+                "(confidence=%.4f, threshold=%.4f).",
+                self.step_count,
+                pred_offset,
+                confidence,
+                self.event_commit_threshold,
+            )
             return
         commit_step = int(self.step_count + pred_offset)
-        confidence = float(pred.get("pred_event_confidence", 0.0))
         if confidence < self.event_commit_threshold:
+            _diag(
+                "Skip FastWAM keyframe schedule at step=%d: confidence %.4f < threshold %.4f "
+                "(offset=%d, commit_step=%d).",
+                self.step_count,
+                confidence,
+                self.event_commit_threshold,
+                pred_offset,
+                commit_step,
+            )
             return
         if commit_step - self._last_committed_memory_step < self._memory_cooldown_steps:
+            _diag(
+                "Skip FastWAM keyframe schedule at step=%d: cooldown gap=%d < %d "
+                "(offset=%d, commit_step=%d, last_committed=%d, confidence=%.4f).",
+                self.step_count,
+                commit_step - self._last_committed_memory_step,
+                self._memory_cooldown_steps,
+                pred_offset,
+                commit_step,
+                self._last_committed_memory_step,
+                confidence,
+            )
             return
         if self._pending_memory_commit_step is not None and self._memory_nms_window > 0:
             if abs(commit_step - self._pending_memory_commit_step) <= self._memory_nms_window:
                 if confidence <= self._pending_memory_confidence:
+                    _diag(
+                        "Skip FastWAM keyframe schedule at step=%d: NMS kept existing pending "
+                        "(new_commit=%d, new_conf=%.4f, pending_commit=%d, pending_conf=%.4f, window=%d).",
+                        self.step_count,
+                        commit_step,
+                        confidence,
+                        self._pending_memory_commit_step,
+                        self._pending_memory_confidence,
+                        self._memory_nms_window,
+                    )
                     return
         self._pending_memory_commit_step = commit_step
         self._pending_memory_confidence = confidence
-        logger.debug(
-            "Scheduled FastWAM keyframe memory commit at step=%d confidence=%.4f",
+        _diag(
+            "Scheduled FastWAM keyframe memory commit at current_step=%d commit_step=%d "
+            "offset=%d confidence=%.4f threshold=%.4f.",
+            self.step_count,
             commit_step,
+            pred_offset,
             confidence,
+            self.event_commit_threshold,
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -583,6 +673,22 @@ class WorldActionRobotWinMemPolicy:
         self._save_attention_stats(path)
         if not self.eval_video_enabled:
             return None
+        if self._pending_memory_commit_step is not None:
+            _diag(
+                "Eval video save reached with pending FastWAM keyframe not committed "
+                "(current_step=%d, pending_commit_step=%d, confidence=%.4f, snapshots=%d, memory_count=%d).",
+                self.step_count,
+                self._pending_memory_commit_step,
+                self._pending_memory_confidence,
+                len(self._pred_keyframe_snapshots),
+                len(self.memory_bank),
+            )
+        else:
+            _diag(
+                "Eval video save reached with FastWAM keyframe snapshots=%d memory_count=%d.",
+                len(self._pred_keyframe_snapshots),
+                len(self.memory_bank),
+            )
         self._save_pred_keyframe_snapshots(path)
         if not self._eval_video_frames:
             logger.warning("No eval comparison frames were collected; skip saving %s", path)
@@ -599,6 +705,7 @@ class WorldActionRobotWinMemPolicy:
 
     def _save_pred_keyframe_snapshots(self, video_path: str) -> Optional[str]:
         if not self._pred_keyframe_snapshots:
+            _diag("No FastWAM predicted keyframe snapshots to save for %s.", video_path)
             return None
 
         final_path = Path(video_path)
@@ -834,6 +941,23 @@ class WorldActionRobotWinMemPolicy:
             pred = infer_method(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+
+        if "pred_event_confidence" in pred or "should_trigger_event" in pred or "pred_event_offset" in pred:
+            _diag(
+                "FastWAM KEM event at step=%d: should=%s offset=%s confidence=%s "
+                "threshold=%.4f memory_count=%d pending=%s last_committed=%d cooldown=%d.",
+                self.step_count,
+                pred.get("should_trigger_event", None),
+                pred.get("pred_event_offset", None),
+                pred.get("pred_event_confidence", None),
+                self.event_commit_threshold,
+                memory_count,
+                self._pending_memory_commit_step,
+                self._last_committed_memory_step,
+                self._memory_cooldown_steps,
+            )
+        else:
+            _diag("FastWAM KEM event absent at step=%d: pred has no event fields.", self.step_count)
 
         if self.eval_video_enabled:
             self._set_active_plan_video(pred.get("video"))

@@ -276,6 +276,14 @@ def main(cfg: DictConfig):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
+    local_pythonpath = [
+        str(PROJECT_ROOT / "src"),
+        str(PROJECT_ROOT),
+    ]
+    existing_pythonpath = env.get("PYTHONPATH")
+    if existing_pythonpath:
+        local_pythonpath.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(local_pythonpath)
 
     with open(log_file, "w", encoding="utf-8") as log_f:
         process = subprocess.Popen(
